@@ -6,21 +6,22 @@ umask 077
 # 本脚本不修改原节点和原订阅，另建一份只含全球 SOCKS5 节点的订阅。
 
 SCRIPT_NAME="$(basename "$0")"
-CONFIG_PATH="${CONFIG_PATH:-/etc/xray/config.json}"
-OUTPUT_DIR="${OUTPUT_DIR:-$(dirname "$CONFIG_PATH")}"
-ORIGINAL_LINK_FILE="${ORIGINAL_LINK_FILE:-$OUTPUT_DIR/vless-links.txt}"
-ORIGINAL_SUB_URL_FILE="${ORIGINAL_SUB_URL_FILE:-$OUTPUT_DIR/yijian-subscription-url.txt}"
-ORIGINAL_SUB_TOKEN_FILE="${ORIGINAL_SUB_TOKEN_FILE:-$OUTPUT_DIR/yijian-subscription-token.txt}"
-SUB_ROOT_FILE="${SUB_ROOT_FILE:-$OUTPUT_DIR/yijian-subscription-root.txt}"
+CONFIG_PATH="/etc/xray/config.json"
+OUTPUT_DIR="/etc/xray"
+ORIGINAL_LINK_FILE="$OUTPUT_DIR/vless-links.txt"
+ORIGINAL_SUB_URL_FILE="$OUTPUT_DIR/yijian-subscription-url.txt"
+ORIGINAL_SUB_TOKEN_FILE="$OUTPUT_DIR/yijian-subscription-token.txt"
+SUB_ROOT_FILE="$OUTPUT_DIR/yijian-subscription-root.txt"
 GLOBAL_TOKEN_FILE="$OUTPUT_DIR/nat-quanqiuluodi-subscription-token.txt"
 GLOBAL_URL_FILE="$OUTPUT_DIR/nat-quanqiuluodi-subscription-url.txt"
 GLOBAL_UUID_PREFIX_FILE="$OUTPUT_DIR/nat-quanqiuluodi-uuid-prefix.txt"
 GLOBAL_LINK_FILE="$OUTPUT_DIR/nat-quanqiuluodi-links.txt"
 MANAGED_PREFIX="nat-global-"
 XHTTP_INBOUND_TAG="vless-xhttp-tls"
-SOCKS_ADDRESS="${SOCKS_ADDRESS:-10.91.0.1}"
-SOCKS_PORT="${SOCKS_PORT:-8080}"
-XRAY_BIN="${XRAY_BIN:-}"
+SOCKS_ADDRESS="10.91.0.1"
+SOCKS_PORT="8080"
+XRAY_BIN=""
+TMP_DIR=""
 TMP_CONFIG=""
 TMP_SUB=""
 
@@ -34,8 +35,11 @@ ok() {
 }
 
 cleanup() {
-  [[ -z "$TMP_CONFIG" || ! -e "$TMP_CONFIG" ]] || rm -f -- "$TMP_CONFIG"
-  [[ -z "$TMP_SUB" || ! -e "$TMP_SUB" ]] || rm -f -- "$TMP_SUB"
+  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+    [[ ! -e "$TMP_CONFIG" ]] || rm -f -- "$TMP_CONFIG"
+    [[ ! -e "$TMP_SUB" ]] || rm -f -- "$TMP_SUB"
+    rmdir -- "$TMP_DIR" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -49,33 +53,7 @@ show_result() {
 }
 
 restart_xray() {
-  local old_pid=""
-
-  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] \
-    && systemctl cat xray-yijian.service >/dev/null 2>&1; then
-    systemctl restart xray-yijian.service
-    return
-  fi
-
-  if command -v rc-service >/dev/null 2>&1 && [[ -x /etc/init.d/xray-yijian ]]; then
-    rc-service xray-yijian restart >/dev/null
-    return
-  fi
-
-  if [[ -s "$OUTPUT_DIR/xray-yijian.pid" ]]; then
-    old_pid="$(sed -n '1p' "$OUTPUT_DIR/xray-yijian.pid")"
-  fi
-  if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" >/dev/null 2>&1; then
-    kill -TERM "$old_pid" || return 1
-    sleep 1
-    ! kill -0 "$old_pid" >/dev/null 2>&1 || return 1
-  fi
-
-  nohup "$XRAY_BIN" run -c "$CONFIG_PATH" >/dev/null 2>&1 &
-  local new_pid="$!"
-  sleep 1
-  kill -0 "$new_pid" >/dev/null 2>&1 || return 1
-  printf '%s\n' "$new_pid" > "$OUTPUT_DIR/xray-yijian.pid"
+  rc-service xray-yijian restart >/dev/null
 }
 
 [[ "$(id -u)" -eq 0 ]] || die "请使用 root 运行此脚本"
@@ -88,6 +66,13 @@ fi
 
 command -v jq >/dev/null 2>&1 || die "未找到 jq，请先成功运行 nat-oneclick.sh"
 command -v openssl >/dev/null 2>&1 || die "未找到 openssl，请先成功运行 nat-oneclick.sh"
+command -v rc-service >/dev/null 2>&1 || die "当前系统没有 OpenRC rc-service，不符合目标 NAT 机环境"
+OS_ID="$(awk -F= '$1 == "ID" {gsub(/\"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null || true)"
+[[ "$OS_ID" == "alpine" ]] || die "当前系统不是 Alpine Linux，不符合目标 NAT 机环境"
+[[ -x /etc/init.d/xray-yijian ]] || die "找不到 OpenRC 服务 xray-yijian，请先成功运行 nat-oneclick.sh"
+[[ -x /etc/init.d/xray-yijian-sub ]] || die "找不到 OpenRC 服务 xray-yijian-sub，请先成功运行 nat-oneclick.sh"
+rc-service xray-yijian status >/dev/null 2>&1 || die "原 Xray 服务 xray-yijian 未运行，未执行修改"
+rc-service xray-yijian-sub status >/dev/null 2>&1 || die "原订阅服务 xray-yijian-sub 未运行，未执行修改"
 [[ -f "$CONFIG_PATH" ]] || die "找不到 Xray 配置：$CONFIG_PATH"
 [[ -s "$ORIGINAL_LINK_FILE" ]] || die "找不到原节点文件：$ORIGINAL_LINK_FILE"
 [[ -s "$ORIGINAL_SUB_URL_FILE" ]] || die "找不到原订阅网址文件：$ORIGINAL_SUB_URL_FILE"
@@ -97,9 +82,7 @@ command -v openssl >/dev/null 2>&1 || die "未找到 openssl，请先成功运�
   || die "SOCKS_PORT 必须是 1 到 65535 之间的整数"
 jq empty "$CONFIG_PATH" >/dev/null 2>&1 || die "Xray 配置不是有效 JSON：$CONFIG_PATH"
 
-if [[ -z "$XRAY_BIN" ]]; then
-  XRAY_BIN="$(command -v xray || true)"
-fi
+XRAY_BIN="$(command -v xray || true)"
 if [[ -z "$XRAY_BIN" && -x /usr/local/bin/xray ]]; then
   XRAY_BIN="/usr/local/bin/xray"
 fi
@@ -311,10 +294,9 @@ GLOBAL_SUB_FILE="$GLOBAL_SUB_DIR/jhsub.txt"
 GLOBAL_PLAIN_FILE="$GLOBAL_SUB_DIR/nodes.txt"
 mkdir -p -- "$GLOBAL_SUB_DIR"
 
-TMP_CONFIG="$(mktemp "$OUTPUT_DIR/nat-global-config.XXXXXX")"
-mv -- "$TMP_CONFIG" "${TMP_CONFIG}.json"
-TMP_CONFIG="${TMP_CONFIG}.json"
-TMP_SUB="$(mktemp "$GLOBAL_SUB_DIR/nat-global-sub.XXXXXX")"
+TMP_DIR="$(mktemp -d /tmp/nat-global-setup.XXXXXX)"
+TMP_CONFIG="$TMP_DIR/config.json"
+TMP_SUB="$TMP_DIR/jhsub.txt"
 
 jq \
   --argjson endpoints "$MANAGED_ENDPOINTS" \
