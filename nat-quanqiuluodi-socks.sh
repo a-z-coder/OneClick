@@ -312,6 +312,8 @@ GLOBAL_PLAIN_FILE="$GLOBAL_SUB_DIR/nodes.txt"
 mkdir -p -- "$GLOBAL_SUB_DIR"
 
 TMP_CONFIG="$(mktemp "$OUTPUT_DIR/nat-global-config.XXXXXX")"
+mv -- "$TMP_CONFIG" "${TMP_CONFIG}.json"
+TMP_CONFIG="${TMP_CONFIG}.json"
 TMP_SUB="$(mktemp "$GLOBAL_SUB_DIR/nat-global-sub.XXXXXX")"
 
 jq \
