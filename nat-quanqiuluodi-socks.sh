@@ -363,8 +363,12 @@ jq \
   ' "$CONFIG_PATH" > "$TMP_CONFIG" || die "生成 Xray 全球路由配置失败，原配置未修改"
 
 jq empty "$TMP_CONFIG" >/dev/null 2>&1 || die "生成的 Xray 配置不是有效 JSON，原配置未修改"
-"$XRAY_BIN" run -test -c "$TMP_CONFIG" >/dev/null 2>&1 \
-  || die "Xray 配置检查失败，原配置未修改"
+if ! XRAY_TEST_OUTPUT="$("$XRAY_BIN" run -test -c "$TMP_CONFIG" 2>&1)"; then
+  echo "---------------- Xray 配置检查日志 ----------------" >&2
+  printf '%s\n' "$XRAY_TEST_OUTPUT" >&2
+  echo "----------------------------------------------------" >&2
+  die "Xray 配置检查失败，原配置未修改"
+fi
 
 jq -r --arg tail "$CDN_TAIL" \
   '.[] | "vless://\(.id)@\($tail)#\(("nat全球-" + .name) | @uri)"' \
