@@ -22,7 +22,8 @@ set -Eeuo pipefail
 #   1. 生成 VLESS-TCP-Reality-Vision 入站；
 #   2. 生成 VLESS-XHTTP-TLS 入站；
 #   3. 按配置中的每个优选域名生成一个 XHTTP-TLS 客户端节点；
-#   4. 写入配置并按当前系统的服务方式启动 Xray。
+#   4. 按配置中的顺序生成节点，并设置整体 IPv4/IPv6 出站；
+#   5. 写入配置并按当前系统的服务方式启动 Xray。
 #
 # 本脚本不依赖 Argosbx，也不会申请或续期证书。
 # 证书、私钥、橙云源站域名、优选域名和端口均由使用者输入。
@@ -33,6 +34,11 @@ MANAGED_XHTTP_TAG="vless-xhttp-tls"
 
 TMP_DIR=""
 CONFIG_PATH=""
+NODE_ORDER=""
+NODE_ORDER_IDS=()
+declare -A NODE_ORDER_SEEN=()
+OUTBOUND_IP_VERSION=""
+OUTBOUND_DOMAIN_STRATEGY=""
 
 cleanup() {
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
@@ -127,6 +133,8 @@ read_deployment_config() {
 
   REALITY_PORT="$(config_value REALITY_PORT)"
   ORIGIN_DOMAIN="$(normalize_domain_value "$(config_value ORIGIN_DOMAIN)")"
+  NODE_ORDER="$(trim_value "$(config_value NODE_ORDER)")"
+  OUTBOUND_IP_VERSION="$(trim_value "$(config_value OUTBOUND_IP_VERSION)")"
   PREFERRED_DOMAINS=()
   declare -A PREFERRED_DOMAIN_VALUES=()
   while IFS= read -r config_line; do
@@ -149,11 +157,14 @@ read_deployment_config() {
   CERT_CONTENT="$(extract_pem_block CERTIFICATE_BEGIN CERTIFICATE_END)"
   KEY_CONTENT="$(extract_pem_block PRIVATE_KEY_BEGIN PRIVATE_KEY_END)"
 
-  [[ -n "$REALITY_PORT" ]] || die "配置中缺少第 1 项：vless直连端口"
-  [[ -n "$ORIGIN_DOMAIN" ]] || die "配置中缺少第 2 项：优选自己域名"
+  [[ -n "$REALITY_PORT" ]] || die "配置中缺少 REALITY_PORT：vless直连端口"
+  [[ -n "$ORIGIN_DOMAIN" ]] || die "配置中缺少 ORIGIN_DOMAIN：优选自己域名"
+  [[ -n "$NODE_ORDER" ]] || die "配置中缺少 NODE_ORDER：请填写 REALITY_V4、REALITY_V6、CDN_1 等节点标识"
+  [[ -n "$OUTBOUND_IP_VERSION" ]] || die "配置中缺少 OUTBOUND_IP_VERSION：只能填写 4 或 6"
+  parse_node_order
   [[ -n "${PREFERRED_DOMAINS[0]:-}" ]] || die "没有找到 PREFERRED_DOMAIN_1、PREFERRED_DOMAIN_2 等 CDN 域名"
-  [[ -n "$XHTTP_PORT" ]] || die "配置中缺少第 4 项：优选端口"
-  [[ -n "$SUB_PORT" ]] || die "配置中缺少第 5 项：订阅端口"
+  [[ -n "$XHTTP_PORT" ]] || die "配置中缺少 XHTTP_PORT：优选端口"
+  [[ -n "$SUB_PORT" ]] || die "配置中缺少 SUB_PORT：订阅端口"
   [[ -n "$CERT_CONTENT" ]] || die "配置中缺少 CERTIFICATE_BEGIN/END 证书区块"
   [[ -n "$KEY_CONTENT" ]] || die "配置中缺少 PRIVATE_KEY_BEGIN/END 私钥区块"
 }
@@ -163,6 +174,26 @@ trim_value() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   printf '%s' "$value"
+}
+
+parse_node_order() {
+  local item
+  local -a raw_order=()
+
+  [[ "$NODE_ORDER" != ,* && "$NODE_ORDER" != *, && "$NODE_ORDER" != *,,* ]] || \
+    die "NODE_ORDER 不能包含空的节点标识：$NODE_ORDER"
+
+  NODE_ORDER_IDS=()
+  NODE_ORDER_SEEN=()
+  IFS=',' read -r -a raw_order <<< "$NODE_ORDER"
+  for item in "${raw_order[@]}"; do
+    item="$(trim_value "$item")"
+    [[ "$item" =~ ^(REALITY_V4|REALITY_V6|CDN_[1-9][0-9]*)$ ]] || \
+      die "NODE_ORDER 中的节点标识无效：$item；可用格式为 REALITY_V4、REALITY_V6、CDN_N"
+    [[ -z "${NODE_ORDER_SEEN[$item]+x}" ]] || die "NODE_ORDER 中的节点重复：$item"
+    NODE_ORDER_IDS+=("$item")
+    NODE_ORDER_SEEN["$item"]=1
+  done
 }
 
 # ORIGIN_DOMAIN 可填写纯域名、Markdown 链接或 http(s) URL；PREFERRED_DOMAIN_N 只接受纯域名。
@@ -211,6 +242,10 @@ validate_port() {
   local value="$2"
   [[ "$value" =~ ^[0-9]+$ ]] || die "$label 必须是数字"
   (( value >= 1 && value <= 65535 )) || die "$label 必须在 1-65535 范围内"
+}
+
+validate_outbound_ip_version() {
+  [[ "$1" == "4" || "$1" == "6" ]] || die "OUTBOUND_IP_VERSION 必须是 4 或 6，当前值：$1"
 }
 
 validate_domain() {
@@ -560,6 +595,8 @@ echo "--- 第 2 步：校验输入参数 ---"
 validate_port "Reality 端口" "$REALITY_PORT"
 validate_port "XHTTP-TLS 端口" "$XHTTP_PORT"
 validate_port "订阅端口" "$SUB_PORT"
+validate_outbound_ip_version "$OUTBOUND_IP_VERSION"
+OUTBOUND_DOMAIN_STRATEGY="UseIPv${OUTBOUND_IP_VERSION}"
 [[ "$REALITY_PORT" != "$XHTTP_PORT" && "$REALITY_PORT" != "$SUB_PORT" && "$XHTTP_PORT" != "$SUB_PORT" ]] || die "三个端口不能相同"
 validate_domain "橙云源站域名" "$ORIGIN_DOMAIN"
 validate_domain_list
@@ -711,10 +748,20 @@ XHTTP_JSON="$(jq -cn \
   '{tag:$tag,port:$port,protocol:"vless",settings:{clients:[{id:$uuid}],decryption:"none"},streamSettings:{network:"xhttp",security:"tls",xhttpSettings:{host:$host,path:$path,mode:"auto"},tlsSettings:{minVersion:"1.2",maxVersion:"1.3",alpn:["h2","h3","http/1.1"],certificates:[{certificateFile:$cert,keyFile:$key}]}},sniffing:{enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:true}}')"
 
 jq --argjson reality "$REALITY_JSON" --argjson xhttp "$XHTTP_JSON" \
-  '.inbounds = ((.inbounds // []) | map(select((.tag // "") != "vless-reality-vision" and (.tag // "") != "vless-xhttp-tls")) + [$reality, $xhttp])' \
+  --arg domain_strategy "$OUTBOUND_DOMAIN_STRATEGY" \
+  '.inbounds = ((.inbounds // []) | map(select((.tag // "") != "vless-reality-vision" and (.tag // "") != "vless-xhttp-tls")) + [$reality, $xhttp])
+   | .outbounds = ((.outbounds // [])
+     | map(if (.protocol // "") == "freedom"
+           then .settings = ((.settings // {}) + {domainStrategy:$domain_strategy})
+           else .
+           end)
+     | if any(.[]; (.protocol // "") == "freedom")
+       then .
+       else [{protocol:"freedom",tag:"yijian-direct",settings:{domainStrategy:$domain_strategy}}] + .
+       end)' \
   "$BASE_CONFIG" > "$TMP_CONFIG" || die "生成 Xray 配置失败"
 jq empty "$TMP_CONFIG" >/dev/null 2>&1 || die "生成的 Xray 配置不是有效 JSON"
-ok "Xray 配置已生成，原有其他入站和出站保持不变"
+ok "Xray 配置已生成，freedom 出站固定使用 IPv${OUTBOUND_IP_VERSION}；原有其他入站和出站保持不变"
 
 echo
 echo "--- 第 4 步：应用 Xray 配置 ---"
@@ -758,27 +805,50 @@ REALITY_PUBLIC_ENC="$(urlencode "$REALITY_PUBLIC_KEY")"
 SHORT_ID_ENC="$(urlencode "$SHORT_ID")"
 ORIGIN_ENC="$(urlencode "$ORIGIN_DOMAIN")"
 PATH_ENC="$(urlencode "$XHTTP_PATH")"
-NODE_LINES=()
-for REALITY_CONNECT_HOST in "${PUBLIC_HOSTS[@]}"; do
-  if [[ "$REALITY_CONNECT_HOST" == \[* ]]; then
-    REALITY_FAMILY="IPv6"
-  else
-    REALITY_FAMILY="IPv4"
-  fi
-  if [[ "$REALITY_FAMILY" == "IPv4" ]]; then
-    REALITY_NODE_NAME="${NODE_NAME_PREFIX}V4-直连"
-  else
-    REALITY_NODE_NAME="${NODE_NAME_PREFIX}V6-直连"
-  fi
-  REALITY_NAME_ENC="$(urlencode "$REALITY_NODE_NAME")"
-  NODE_LINES+=("vless://${UUID_REALITY}@${REALITY_CONNECT_HOST}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI_ENC}&fp=chrome&pbk=${REALITY_PUBLIC_ENC}&sid=${SHORT_ID_ENC}&type=tcp&headerType=none#${REALITY_NAME_ENC}")
+declare -A NODE_LINK_BASE=()
+declare -A NODE_BASE_NAME=()
+declare -A NODE_ORDER_USED=()
+NODE_GENERATION_ORDER=()
+
+if [[ -n "$PUBLIC_IPV4" ]]; then
+  NODE_LINK_BASE[REALITY_V4]="vless://${UUID_REALITY}@${PUBLIC_IPV4}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI_ENC}&fp=chrome&pbk=${REALITY_PUBLIC_ENC}&sid=${SHORT_ID_ENC}&type=tcp&headerType=none"
+  NODE_BASE_NAME[REALITY_V4]="${NODE_NAME_PREFIX}V4-直连"
+  NODE_GENERATION_ORDER+=(REALITY_V4)
+fi
+if [[ -n "$PUBLIC_IPV6" ]]; then
+  NODE_LINK_BASE[REALITY_V6]="vless://${UUID_REALITY}@[${PUBLIC_IPV6}]:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI_ENC}&fp=chrome&pbk=${REALITY_PUBLIC_ENC}&sid=${SHORT_ID_ENC}&type=tcp&headerType=none"
+  NODE_BASE_NAME[REALITY_V6]="${NODE_NAME_PREFIX}V6-直连"
+  NODE_GENERATION_ORDER+=(REALITY_V6)
+fi
+
+for preferred_index in "${!PREFERRED_DOMAINS[@]}"; do
+  preferred_node_id="CDN_$((preferred_index + 1))"
+  PREFERRED_DOMAIN="${PREFERRED_DOMAINS[$preferred_index]}"
+  NODE_LINK_BASE["$preferred_node_id"]="vless://${UUID_XHTTP}@${PREFERRED_DOMAIN}:${XHTTP_PORT}?encryption=none&security=tls&sni=${ORIGIN_ENC}&host=${ORIGIN_ENC}&type=xhttp&path=${PATH_ENC}&mode=auto"
+  NODE_BASE_NAME["$preferred_node_id"]="${NODE_NAME_PREFIX}V4-CDN-${PREFERRED_DOMAIN}-直连"
+  NODE_GENERATION_ORDER+=("$preferred_node_id")
 done
 
-for PREFERRED_DOMAIN in "${PREFERRED_DOMAINS[@]}"; do
-  ORIGIN_ENC="$(urlencode "$ORIGIN_DOMAIN")"
-  XHTTP_NAME="${NODE_NAME_PREFIX}V4-CDN-${PREFERRED_DOMAIN}-直连"
-  XHTTP_NAME_ENC="$(urlencode "$XHTTP_NAME")"
-  NODE_LINES+=("vless://${UUID_XHTTP}@${PREFERRED_DOMAIN}:${XHTTP_PORT}?encryption=none&security=tls&sni=${ORIGIN_ENC}&host=${ORIGIN_ENC}&type=xhttp&path=${PATH_ENC}&mode=auto#${XHTTP_NAME_ENC}")
+NODE_LINES=()
+node_number=0
+for node_id in "${NODE_ORDER_IDS[@]}"; do
+  if [[ -z "${NODE_LINK_BASE[$node_id]+x}" ]]; then
+    if [[ "$node_id" == CDN_* ]]; then
+      die "NODE_ORDER 中的 $node_id 没有对应的 PREFERRED_DOMAIN_N"
+    fi
+    warn "NODE_ORDER 中的 $node_id 当前没有可用公网地址，已跳过"
+    continue
+  fi
+  node_number=$((node_number + 1))
+  node_order_prefix="$(printf '%02d' "$node_number")-"
+  node_display_name="${node_order_prefix}${NODE_BASE_NAME[$node_id]}"
+  node_display_name_enc="$(urlencode "$node_display_name")"
+  NODE_LINES+=("${NODE_LINK_BASE[$node_id]}#${node_display_name_enc}")
+  NODE_ORDER_USED["$node_id"]=1
+done
+
+for node_id in "${NODE_GENERATION_ORDER[@]}"; do
+  [[ -n "${NODE_ORDER_USED[$node_id]+x}" ]] || die "实际生成的节点 $node_id 未在 NODE_ORDER 中配置"
 done
 
 LINK_FILE="$OUTPUT_DIR/vless-links.txt"
@@ -815,6 +885,7 @@ echo "订阅链接（网址）：$SUB_URL"
 echo "订阅文件（明文 jhsub.txt）：$SUB_FILE"
 echo "Xray 配置：$CONFIG_PATH"
 echo "占用端口：Reality=$REALITY_PORT，XHTTP-TLS=$XHTTP_PORT，订阅HTTP=$SUB_PORT"
+echo "整体出站：IPv${OUTBOUND_IP_VERSION}（$OUTBOUND_DOMAIN_STRATEGY）"
 echo ""
 echo "注意：优选域名为 ${PREFERRED_DOMAINS[*]}；证书域名、Host 和 SNI 为 $ORIGIN_DOMAIN。"
 echo "注意：Reality 伪装域名和目标均为 apple.com，采用 Argosbx 默认设置。"
