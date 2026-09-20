@@ -23,10 +23,12 @@ set -Eeuo pipefail
 #   2. 生成 VLESS-XHTTP-TLS 入站；
 #   3. 按配置中的每个优选域名生成一个 XHTTP-TLS 客户端节点；
 #   4. 按配置中的顺序生成节点，并设置整体 IPv4/IPv6 出站；
-#   5. 写入配置并按当前系统的服务方式启动 Xray。
+#   5. 使用同一源站域名提供 HTTPS 订阅；订阅端口与 Xray 端口分开。
+#   6. 写入配置并按当前系统的服务方式启动 Xray 和订阅服务。
 #
 # 本脚本不依赖 Argosbx，也不会申请或续期证书。
-# 证书、私钥、橙云源站域名、优选域名和端口均由使用者输入。
+# 证书、私钥、橙云源站域名、订阅域名、优选域名和端口均由使用者输入。
+# ORIGIN_DOMAIN 用于 XHTTP；SUB_DOMAIN 用于 HTTPS 订阅，两者可以相同但通常建议分开。
 
 SCRIPT_NAME="$(basename "$0")"
 MANAGED_REALITY_TAG="vless-reality-vision"
@@ -39,6 +41,10 @@ NODE_ORDER_IDS=()
 declare -A NODE_ORDER_SEEN=()
 OUTBOUND_IP_VERSION=""
 OUTBOUND_DOMAIN_STRATEGY=""
+NGINX_BIN=""
+SUB_NGINX_CONF=""
+SUB_NGINX_PID=""
+SUB_NGINX_ERROR_LOG=""
 
 cleanup() {
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
@@ -71,35 +77,25 @@ command_exists() {
 
 # 一键部署所需的少量基础工具；只在缺少依赖时安装。
 install_dependencies() {
-  local httpd_ready=1
-  if command_exists apk; then
-    command_exists busybox-extras && busybox-extras httpd --help >/dev/null 2>&1 || httpd_ready=0
-  elif command_exists httpd && httpd --help >/dev/null 2>&1; then
-    :
-  elif command_exists busybox && busybox httpd --help >/dev/null 2>&1; then
-    :
-  elif command_exists busybox-extras && busybox-extras httpd --help >/dev/null 2>&1; then
-    :
-  else
-    httpd_ready=0
-  fi
+  local nginx_ready=0
+  find_nginx_runner && nginx_ready=1 || true
 
   if command_exists jq && command_exists openssl && command_exists unzip && \
-     command_exists sha256sum && { command_exists curl || command_exists wget; } && \
-     [[ "$httpd_ready" -eq 1 ]]; then
+      command_exists sha256sum && { command_exists curl || command_exists wget; } && \
+      [[ "$nginx_ready" -eq 1 ]]; then
     return 0
   fi
 
-  echo "[信息] 正在安装 Xray 配置所需的基础工具"
+  echo "[信息] 正在安装 Xray 和 HTTPS 订阅所需的基础工具"
   if command_exists apk; then
-    apk add --no-cache jq openssl unzip coreutils curl ca-certificates busybox-extras || die "Alpine 基础工具安装失败"
+    apk add --no-cache jq openssl unzip coreutils curl ca-certificates nginx || die "Alpine 基础工具安装失败"
   elif command_exists apt-get; then
     DEBIAN_FRONTEND=noninteractive apt-get update || die "APT 软件源更新失败"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y jq openssl unzip coreutils curl ca-certificates busybox || die "Debian/Ubuntu 基础工具安装失败"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y jq openssl unzip coreutils curl ca-certificates nginx || die "Debian/Ubuntu 基础工具安装失败"
   elif command_exists dnf; then
-    dnf install -y jq openssl unzip coreutils curl ca-certificates busybox || die "DNF 基础工具安装失败"
+    dnf install -y jq openssl unzip coreutils curl ca-certificates nginx || die "DNF 基础工具安装失败"
   elif command_exists yum; then
-    yum install -y jq openssl unzip coreutils curl ca-certificates busybox || die "YUM 基础工具安装失败"
+    yum install -y jq openssl unzip coreutils curl ca-certificates nginx || die "YUM 基础工具安装失败"
   else
     die "不支持当前软件包管理器，无法自动安装基础工具"
   fi
@@ -108,8 +104,8 @@ install_dependencies() {
   command_exists openssl || die "安装后仍未找到 openssl"
   command_exists unzip || die "安装后仍未找到 unzip"
   command_exists curl || command_exists wget || die "安装后仍未找到 curl 或 wget"
-  find_httpd_runner || true
-  [[ -n "${HTTPD_BIN:-}" ]] || die "安装后仍未找到可用的 HTTP 服务"
+  find_nginx_runner || true
+  [[ -n "${NGINX_BIN:-}" ]] || die "安装后仍未找到可用的 Nginx HTTPS 服务"
   ok "基础工具安装完成"
 }
 
@@ -133,6 +129,7 @@ read_deployment_config() {
 
   REALITY_PORT="$(config_value REALITY_PORT)"
   ORIGIN_DOMAIN="$(normalize_domain_value "$(config_value ORIGIN_DOMAIN)")"
+  SUB_DOMAIN="$(normalize_domain_value "$(config_value SUB_DOMAIN)")"
   NODE_ORDER="$(trim_value "$(config_value NODE_ORDER)")"
   OUTBOUND_IP_VERSION="$(trim_value "$(config_value OUTBOUND_IP_VERSION)")"
   PREFERRED_DOMAINS=()
@@ -159,6 +156,7 @@ read_deployment_config() {
 
   [[ -n "$REALITY_PORT" ]] || die "配置中缺少 REALITY_PORT：vless直连端口"
   [[ -n "$ORIGIN_DOMAIN" ]] || die "配置中缺少 ORIGIN_DOMAIN：优选自己域名"
+  [[ -n "$SUB_DOMAIN" ]] || die "配置中缺少 SUB_DOMAIN：HTTPS 订阅域名"
   [[ -n "$NODE_ORDER" ]] || die "配置中缺少 NODE_ORDER：请填写 REALITY_V4、REALITY_V6、CDN_1 等节点标识"
   [[ -n "$OUTBOUND_IP_VERSION" ]] || die "配置中缺少 OUTBOUND_IP_VERSION：只能填写 4 或 6"
   parse_node_order
@@ -196,7 +194,7 @@ parse_node_order() {
   done
 }
 
-# ORIGIN_DOMAIN 可填写纯域名、Markdown 链接或 http(s) URL；PREFERRED_DOMAIN_N 只接受纯域名。
+# ORIGIN_DOMAIN、SUB_DOMAIN 可填写纯域名、Markdown 链接或 http(s) URL；PREFERRED_DOMAIN_N 只接受纯域名。
 normalize_domain_value() {
   local value markdown_pattern
   value="$(trim_value "$1")"
@@ -300,22 +298,18 @@ rebuild_subscription_url() {
   local output_dir="$1"
   local sub_file=""
   local sub_token=""
-  local sub_port=""
-  local public_host=""
+  local sub_domain=""
 
   sub_file="$(find_subscription_file "$output_dir")"
   [[ -n "$sub_file" ]] || return 1
   sub_token="$(basename "$(dirname "$sub_file")")"
   [[ -n "$sub_token" ]] || return 1
 
-  if [[ -s "$output_dir/yijian-subscription-port.txt" ]]; then
-    sub_port="$(sed -n '1p' "$output_dir/yijian-subscription-port.txt")"
-  elif command_exists ps; then
-    sub_port="$(ps 2>/dev/null | awk '/[h]ttpd/ { for (i = 1; i < NF; i++) if ($i == "-p") { print $(i + 1); exit } }')"
+  if [[ -s "$output_dir/yijian-subscription-domain.txt" ]]; then
+    sub_domain="$(sed -n '1p' "$output_dir/yijian-subscription-domain.txt" | tr -d '\r')"
   fi
-  [[ "$sub_port" =~ ^[0-9]+$ ]] || return 1
-  public_host="$(detect_public_host)" || return 1
-  printf 'http://%s:%s/%s/jhsub.txt' "$public_host" "$sub_port" "$sub_token"
+  [[ -n "$sub_domain" ]] || return 1
+  printf 'https://%s/%s/jhsub.txt' "$sub_domain" "$sub_token"
 }
 
 show_port_usage() {
@@ -457,57 +451,120 @@ EOF
   fi
 }
 
-# 选择参考脚本使用的 HTTP 服务实现。Alpine 优先使用 busybox-extras，
-# 其他系统再回退到带 httpd applet 的 BusyBox 或独立 httpd 命令。
-find_httpd_runner() {
-  local candidate
-  HTTPD_BIN=""
-  HTTPD_APPLET=""
-  if command_exists apk && command_exists busybox-extras; then
-    candidate="$(command -v busybox-extras)"
-    if "$candidate" httpd --help >/dev/null 2>&1; then
-      HTTPD_BIN="$candidate"
-      HTTPD_APPLET="httpd"
-      return 0
-    fi
-  fi
-  if command_exists httpd && httpd --help >/dev/null 2>&1; then
-    HTTPD_BIN="$(command -v httpd)"
+# 查找 Nginx；订阅服务使用独立配置，不接管系统默认 Nginx 配置。
+find_nginx_runner() {
+  if command_exists nginx && nginx -v >/dev/null 2>&1; then
+    NGINX_BIN="$(command -v nginx)"
     return 0
   fi
-  for candidate in busybox busybox-extras; do
-    if command_exists "$candidate"; then
-      candidate="$(command -v "$candidate")"
-      if "$candidate" httpd --help >/dev/null 2>&1; then
-        HTTPD_BIN="$candidate"
-        HTTPD_APPLET="httpd"
-        return 0
-      fi
-    fi
-  done
+  NGINX_BIN=""
   return 1
 }
 
-# 将订阅 HTTP 服务注册为系统服务，确保服务器重启后自动恢复。
+stop_existing_subscription_service() {
+  local old_pid=""
+  local old_cmd=""
+
+  if command_exists systemctl && [[ -d /run/systemd/system ]]; then
+    systemctl stop xray-yijian-sub.service >/dev/null 2>&1 || true
+  elif command_exists rc-service && [[ -x /etc/init.d/xray-yijian-sub ]]; then
+    rc-service xray-yijian-sub stop >/dev/null 2>&1 || true
+  fi
+
+  for pid_file in /run/xray-yijian-sub.pid /run/xray-yijian-sub-nginx.pid; do
+    if [[ -s "$pid_file" ]]; then
+      old_pid="$(sed -n '1p' "$pid_file" | tr -d '\r')"
+      if [[ "$old_pid" =~ ^[0-9]+$ && -r "/proc/$old_pid/cmdline" ]]; then
+        old_cmd="$(tr '\0' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null || true)"
+        if [[ "$old_cmd" == *httpd* || "$old_cmd" == *nginx* ]]; then
+          kill "$old_pid" >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
+  done
+}
+
+write_subscription_nginx_config() {
+  [[ -n "$NGINX_BIN" ]] || die "未找到 Nginx，无法提供 HTTPS 订阅"
+  [[ -n "$SUB_NGINX_CONF" && -n "$SUB_NGINX_PID" ]] || die "HTTPS 订阅服务路径未初始化"
+  mkdir -p -- "$SUB_ROOT"
+  if id nginx >/dev/null 2>&1; then
+    chown root:nginx "$SUB_ROOT" 2>/dev/null || die "无法设置订阅目录属主"
+    chmod 750 "$SUB_ROOT"
+  else
+    die "Nginx 用户不存在，无法安全提供订阅文件"
+  fi
+
+  SUB_NGINX_ERROR_LOG="$OUTPUT_DIR/yijian-subscription-nginx-error.log"
+  cat > "$SUB_NGINX_CONF" <<EOF
+user nginx;
+daemon off;
+worker_processes 1;
+pid $SUB_NGINX_PID;
+error_log $SUB_NGINX_ERROR_LOG warn;
+
+events {
+    worker_connections 64;
+}
+
+http {
+    access_log off;
+    sendfile on;
+    keepalive_timeout 15;
+
+    server {
+        listen $SUB_PORT ssl;
+        listen [::]:$SUB_PORT ssl;
+        server_name $SUB_DOMAIN;
+
+        ssl_certificate $CERT_FILE;
+        ssl_certificate_key $KEY_FILE;
+        ssl_protocols TLSv1.2 TLSv1.3;
+
+        location ~ ^/[0-9a-f]{24}/jhsub\.txt$ {
+            root $SUB_ROOT;
+            default_type text/plain;
+            add_header Cache-Control "no-store" always;
+            try_files \$uri =404;
+        }
+
+        location / {
+            return 404;
+        }
+    }
+}
+EOF
+  "$NGINX_BIN" -t -c "$SUB_NGINX_CONF" >/dev/null 2>&1 || die "Nginx HTTPS 订阅配置检查失败，请检查证书、端口或域名"
+}
+
+# 将订阅 HTTPS 服务注册为系统服务，确保服务器重启后自动恢复。
 start_subscription_service() {
-  find_httpd_runner || true
-  [[ -n "$HTTPD_BIN" ]] || die "未找到可用的 httpd（Alpine 请安装 busybox-extras）"
+  find_nginx_runner || true
+  [[ -n "$NGINX_BIN" ]] || die "未找到可用的 Nginx HTTPS 服务"
+
+  SUB_NGINX_CONF="$OUTPUT_DIR/yijian-subscription-nginx.conf"
+  SUB_NGINX_PID="/run/xray-yijian-sub-nginx.pid"
+  write_subscription_nginx_config
+  stop_existing_subscription_service
 
   # 记录服务参数，供 show 和人工排查使用。
   printf '%s\n' "$SUB_PORT" > "$OUTPUT_DIR/yijian-subscription-port.txt"
   printf '%s\n' "$SUB_TOKEN" > "$OUTPUT_DIR/yijian-subscription-token.txt"
   printf '%s\n' "$SUB_ROOT" > "$OUTPUT_DIR/yijian-subscription-root.txt"
-  chmod 600 "$OUTPUT_DIR/yijian-subscription-port.txt" "$OUTPUT_DIR/yijian-subscription-token.txt" "$OUTPUT_DIR/yijian-subscription-root.txt"
+  printf '%s\n' "$SUB_DOMAIN" > "$OUTPUT_DIR/yijian-subscription-domain.txt"
+  chmod 600 "$OUTPUT_DIR/yijian-subscription-port.txt" "$OUTPUT_DIR/yijian-subscription-token.txt" \
+    "$OUTPUT_DIR/yijian-subscription-root.txt" "$OUTPUT_DIR/yijian-subscription-domain.txt"
 
   if command_exists systemctl && [[ -d /run/systemd/system ]]; then
     cat > /etc/systemd/system/xray-yijian-sub.service <<EOF
 [Unit]
-Description=Xray yijian subscription HTTP service
+Description=Xray yijian subscription HTTPS service
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$HTTPD_BIN ${HTTPD_APPLET:+$HTTPD_APPLET }-f -p $SUB_PORT -h $SUB_ROOT
+ExecStart=$NGINX_BIN -c $SUB_NGINX_CONF
+ExecStop=$NGINX_BIN -c $SUB_NGINX_CONF -s quit
 Restart=on-failure
 RestartSec=5s
 
@@ -515,39 +572,49 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload || die "systemd 配置加载失败"
-    systemctl enable --now xray-yijian-sub.service || die "systemd 无法启动订阅 HTTP 服务"
-    systemctl is-active --quiet xray-yijian-sub.service || die "订阅 HTTP 服务未处于运行状态，请检查端口 $SUB_PORT 是否被占用"
+    systemctl enable --now xray-yijian-sub.service || die "systemd 无法启动订阅 HTTPS 服务"
+    systemctl is-active --quiet xray-yijian-sub.service || die "订阅 HTTPS 服务未处于运行状态，请检查端口 $SUB_PORT 是否被占用"
     SUB_START_MODE="systemd：xray-yijian-sub.service"
   elif command_exists rc-service && command_exists rc-update; then
     cat > /etc/init.d/xray-yijian-sub <<EOF
 #!/sbin/openrc-run
-description="Xray yijian subscription HTTP service"
-command="$HTTPD_BIN"
-command_args="${HTTPD_APPLET:+$HTTPD_APPLET }-f -p $SUB_PORT -h $SUB_ROOT"
+description="Xray yijian subscription HTTPS service"
+command="$NGINX_BIN"
+command_args="-c $SUB_NGINX_CONF"
 command_background="yes"
-pidfile="/run/xray-yijian-sub.pid"
+pidfile="$SUB_NGINX_PID"
 depend() {
   need net
 }
 EOF
     chmod 755 /etc/init.d/xray-yijian-sub
     rc-update add xray-yijian-sub default >/dev/null 2>&1 || die "OpenRC 无法添加订阅服务自启动"
-    rc-service xray-yijian-sub restart >/dev/null 2>&1 || rc-service xray-yijian-sub start >/dev/null 2>&1 || die "OpenRC 无法启动订阅 HTTP 服务"
-    rc-service xray-yijian-sub status >/dev/null 2>&1 || die "订阅 HTTP 服务未处于运行状态，请检查端口 $SUB_PORT 是否被占用"
+    rc-service xray-yijian-sub restart >/dev/null 2>&1 || rc-service xray-yijian-sub start >/dev/null 2>&1 || die "OpenRC 无法启动订阅 HTTPS 服务"
+    rc-service xray-yijian-sub status >/dev/null 2>&1 || die "订阅 HTTPS 服务未处于运行状态，请检查端口 $SUB_PORT 是否被占用"
     SUB_START_MODE="OpenRC：xray-yijian-sub"
   else
     # 无服务管理器时仅能维持当前运行周期，避免虚报“重启后恢复”。
-    if [[ -n "$HTTPD_APPLET" ]]; then
-      nohup "$HTTPD_BIN" "$HTTPD_APPLET" -f -p "$SUB_PORT" -h "$SUB_ROOT" >/dev/null 2>&1 &
-    else
-      nohup "$HTTPD_BIN" -f -p "$SUB_PORT" -h "$SUB_ROOT" >/dev/null 2>&1 &
-    fi
+    nohup "$NGINX_BIN" -c "$SUB_NGINX_CONF" >/dev/null 2>&1 &
     SUB_PID="$!"
     sleep 1
-    kill -0 "$SUB_PID" >/dev/null 2>&1 || die "订阅 HTTP 服务启动后已退出，请检查端口 $SUB_PORT 是否被占用"
+    kill -0 "$SUB_PID" >/dev/null 2>&1 || die "订阅 HTTPS 服务启动后已退出，请检查端口 $SUB_PORT 是否被占用"
     printf '%s\n' "$SUB_PID" > "$OUTPUT_DIR/xray-yijian-sub.pid"
     SUB_START_MODE="后台进程：PID $SUB_PID（当前环境没有可用的系统服务管理器，重启后不会自动恢复）"
   fi
+}
+
+verify_subscription_https() {
+  local local_url="https://${SUB_DOMAIN}:${SUB_PORT}/${SUB_TOKEN}/jhsub.txt"
+  local local_check_url="https://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}/jhsub.txt"
+  local resolve_value="${SUB_DOMAIN}:${SUB_PORT}:127.0.0.1"
+  local response=""
+
+  if command_exists curl; then
+    response="$(curl -fsSk --max-time 5 --resolve "$resolve_value" "$local_url" 2>/dev/null || true)"
+  elif command_exists wget; then
+    response="$(wget --no-check-certificate -qO- --timeout=5 --header="Host: $SUB_DOMAIN" "$local_check_url" 2>/dev/null || true)"
+  fi
+  [[ "$response" == vless://* ]] || die "HTTPS 订阅本机检查失败，请检查 Nginx、证书、Token 路径和端口 $SUB_PORT"
 }
 
 [[ "$(id -u)" -eq 0 ]] || die "请使用 root 运行此脚本"
@@ -599,6 +666,7 @@ validate_outbound_ip_version "$OUTBOUND_IP_VERSION"
 OUTBOUND_DOMAIN_STRATEGY="UseIPv${OUTBOUND_IP_VERSION}"
 [[ "$REALITY_PORT" != "$XHTTP_PORT" && "$REALITY_PORT" != "$SUB_PORT" && "$XHTTP_PORT" != "$SUB_PORT" ]] || die "三个端口不能相同"
 validate_domain "橙云源站域名" "$ORIGIN_DOMAIN"
+validate_domain "HTTPS 订阅域名" "$SUB_DOMAIN"
 validate_domain_list
 validate_host_port "Reality 伪装目标" "$REALITY_DEST"
 [[ "$XHTTP_PATH" == /* ]] || XHTTP_PATH="/$XHTTP_PATH"
@@ -620,7 +688,8 @@ chmod 600 "$CERT_FILE" "$KEY_FILE"
 
 openssl x509 -in "$CERT_FILE" -noout >/dev/null 2>&1 || die "证书不是有效 PEM X.509 文件：$CERT_FILE"
 openssl pkey -in "$KEY_FILE" -passin pass: -noout >/dev/null 2>&1 || die "私钥不存在或不是未加密私钥：$KEY_FILE"
-openssl x509 -in "$CERT_FILE" -noout -checkhost "$ORIGIN_DOMAIN" >/dev/null 2>&1 || die "证书不包含橙云源站域名：$ORIGIN_DOMAIN"
+openssl x509 -in "$CERT_FILE" -noout -checkhost "$ORIGIN_DOMAIN" >/dev/null 2>&1 || die "证书不包含 XHTTP 源站域名：$ORIGIN_DOMAIN"
+openssl x509 -in "$CERT_FILE" -noout -checkhost "$SUB_DOMAIN" >/dev/null 2>&1 || die "证书不包含 HTTPS 订阅域名：$SUB_DOMAIN"
 
 CERT_PUB_SHA="$(openssl x509 -in "$CERT_FILE" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
 KEY_PUB_SHA="$(openssl pkey -in "$KEY_FILE" -passin pass: -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
@@ -785,14 +854,11 @@ else
   PUBLIC_IPV6="$(timeout 5 wget -6 --tries=2 -qO- "$V46_URL" 2>/dev/null | tr -d '[:space:]' || true)"
 fi
 PUBLIC_HOSTS=()
-SUB_HOST=""
 if [[ "$PUBLIC_IPV4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
   PUBLIC_HOSTS+=("$PUBLIC_IPV4")
-  SUB_HOST="$PUBLIC_IPV4"
 fi
 if [[ "$PUBLIC_IPV6" == *:* ]]; then
   PUBLIC_HOSTS+=("[$PUBLIC_IPV6]")
-  [[ -n "$SUB_HOST" ]] || SUB_HOST="[$PUBLIC_IPV6]"
 fi
 (( ${#PUBLIC_HOSTS[@]} > 0 )) || die "未能探测公网 IPv4 或 IPv6"
 IP_FAMILY=""
@@ -861,16 +927,20 @@ SUB_PLAIN="$SUB_DIR/nodes.txt"
 mkdir -p -- "$SUB_DIR"
 printf '%s\n' "${NODE_LINES[@]}" > "$SUB_FILE"
 cp -- "$SUB_FILE" "$SUB_PLAIN"
-chmod 600 "$LINK_FILE" "$SUB_FILE" "$SUB_PLAIN"
+chmod 600 "$LINK_FILE"
+chmod 640 "$SUB_FILE" "$SUB_PLAIN"
+chown root:nginx "$SUB_ROOT" "$SUB_DIR" "$SUB_FILE" "$SUB_PLAIN" 2>/dev/null || die "无法设置订阅文件属主"
+chmod 750 "$SUB_ROOT" "$SUB_DIR"
 ok "节点链接已写入：$LINK_FILE"
 
 echo
-echo "--- 第 6 步：启动订阅 HTTP 服务 ---"
-SUB_URL="http://${SUB_HOST}:${SUB_PORT}/${SUB_TOKEN}/jhsub.txt"
+echo "--- 第 6 步：启动订阅 HTTPS 服务 ---"
+SUB_URL="https://${SUB_DOMAIN}/${SUB_TOKEN}/jhsub.txt"
 SUB_URL_FILE="$OUTPUT_DIR/yijian-subscription-url.txt"
 printf '%s\n' "$SUB_URL" > "$SUB_URL_FILE"
 chmod 600 "$SUB_URL_FILE"
 start_subscription_service
+verify_subscription_https
 ok "订阅服务已启动：$SUB_START_MODE"
 ok "订阅网址已保存：$SUB_URL_FILE"
 
@@ -884,8 +954,9 @@ echo ""
 echo "订阅链接（网址）：$SUB_URL"
 echo "订阅文件（明文 jhsub.txt）：$SUB_FILE"
 echo "Xray 配置：$CONFIG_PATH"
-echo "占用端口：Reality=$REALITY_PORT，XHTTP-TLS=$XHTTP_PORT，订阅HTTP=$SUB_PORT"
+echo "占用端口：Reality=$REALITY_PORT，XHTTP-TLS=$XHTTP_PORT，订阅HTTPS源站=$SUB_PORT"
 echo "整体出站：IPv${OUTBOUND_IP_VERSION}（$OUTBOUND_DOMAIN_STRATEGY）"
 echo ""
-echo "注意：优选域名为 ${PREFERRED_DOMAINS[*]}；证书域名、Host 和 SNI 为 $ORIGIN_DOMAIN。"
+echo "注意：XHTTP 源站域名、Host 和 SNI 为 $ORIGIN_DOMAIN；HTTPS 订阅域名为 $SUB_DOMAIN。"
+echo "注意：Cloudflare Origin Rules 应将 $SUB_DOMAIN:443 回源到源站端口 $SUB_PORT。"
 echo "注意：Reality 伪装域名和目标均为 apple.com，采用 Argosbx 默认设置。"
