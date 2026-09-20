@@ -95,7 +95,8 @@ ORIGINAL_SUB_TOKEN="$(sed -n '1p' "$ORIGINAL_SUB_TOKEN_FILE" | tr -d '\r')"
 [[ "$ORIGINAL_SUB_URL" == http://*/*/jhsub.txt || "$ORIGINAL_SUB_URL" == https://*/*/jhsub.txt ]] \
   || die "无法解析原订阅网址：$ORIGINAL_SUB_URL"
 
-# 优先国家按要求排列，其后是其他国家/地区，最后是流媒体和服务入口。
+# 先按国家分组，再把该国家的媒体入口紧跟在国家节点后面。
+# 中国固定放在最后；国家组的前 26 组严格按用户要求排列。
 ENDPOINTS_JSON="$(cat <<'JSON'
 [
   {"code":"us","name":"美国"},
@@ -232,12 +233,41 @@ ENDPOINTS_JSON="$(cat <<'JSON'
 JSON
 )"
 
+# 官方清单把媒体入口放在列表末尾；这里按所属国家重新分组，避免同一国家的入口被拆散。
+ENDPOINTS_JSON="$(jq -c '
+  def group_code:
+    if (.code | IN("nfx", "apus", "hulu", "esus", "hbom", "para", "abus", "dsus", "ptv", "fbtv", "cgpt", "mgmp", "tubi", "roku", "dscv", "cwnw", "hall", "xumo", "amc")) then "us"
+    elif (.code | IN("nxuk", "bpuk", "ch4", "itv", "apuk", "ch5")) then "gb"
+    elif (.code | IN("nxau", "nine", "ftel", "tply", "sbsa", "optu", "svnp")) then "au"
+    elif .code == "nfde" then "de"
+    elif (.code | IN("spnt", "cbcg")) then "ca"
+    elif .code == "svtv" then "at"
+    elif .code == "amtv" then "in"
+    else .code
+    end;
+  ["us", "sg", "jp", "hk", "tw", "kr", "my", "ca", "au", "nz", "gb", "de", "fr", "nl", "mx", "br", "ar", "cl", "ch", "ae", "za", "is", "ng", "tr", "ua", "dk"] as $priority;
+  {"us": "美国", "sg": "新加坡", "jp": "日本", "hk": "香港", "tw": "台湾", "kr": "韩国", "my": "马来西亚", "ca": "加拿大", "au": "澳大利亚", "nz": "新西兰", "gb": "英国", "de": "德国", "fr": "法国", "nl": "荷兰", "mx": "墨西哥", "br": "巴西", "ar": "阿根廷", "cl": "智利", "ch": "瑞士", "ae": "阿联酋", "za": "南非", "is": "冰岛", "ng": "尼日利亚", "tr": "土耳其", "ua": "乌克兰", "dk": "丹麦", "cn": "中国"} as $country_names;
+  . as $all
+  | ($all | map(.code) | to_entries | map({key: .value, value: .key}) | from_entries) as $source_rank
+  | ($priority | to_entries | map({key: .value, value: .key}) | from_entries) as $priority_rank
+  | map(. + {group: group_code})
+  | map(. + {
+      country: ($country_names[.group] // .name),
+      media: (.group != .code),
+      group_rank: (if .group == "cn" then 10000 elif $priority_rank[.group] != null then $priority_rank[.group] else 1000 + ($source_rank[.group] // 999) end),
+      media_rank: (if .group == .code then 0 else 1 end),
+      source_rank: ($source_rank[.code] // 9999)
+    })
+  | sort_by([.group_rank, .media_rank, .source_rank])
+  | map({code, name, country, media})
+' <<<"$ENDPOINTS_JSON")"
+
 ENDPOINT_COUNT="$(jq 'length' <<<"$ENDPOINTS_JSON")"
 UNIQUE_CODE_COUNT="$(jq '[.[].code] | unique | length' <<<"$ENDPOINTS_JSON")"
-PRIORITY_CODES="$(jq -r '.[0:25] | map(.code) | join(",")' <<<"$ENDPOINTS_JSON")"
+PRIORITY_CODES="$(jq -r '[.[] | select(.media | not) | .code] | .[0:26] | join(",")' <<<"$ENDPOINTS_JSON")"
 [[ "$ENDPOINT_COUNT" -eq 130 && "$UNIQUE_CODE_COUNT" -eq 130 ]] \
   || die "脚本内置 SOCKS 清单不完整或存在重复 code"
-[[ "$PRIORITY_CODES" == "us,sg,jp,hk,kr,my,au,nz,ca,mx,br,ar,cl,gb,de,fr,nl,ch,ae,za,is,ng,tr,ua,dk" ]] \
+[[ "$PRIORITY_CODES" == "us,sg,jp,hk,tw,kr,my,ca,au,nz,gb,de,fr,nl,mx,br,ar,cl,ch,ae,za,is,ng,tr,ua,dk" ]] \
   || die "脚本内置优先国家顺序不正确"
 
 if [[ -s "$GLOBAL_UUID_PREFIX_FILE" ]]; then
@@ -355,7 +385,15 @@ if ! XRAY_TEST_OUTPUT="$("$XRAY_BIN" run -test -c "$TMP_CONFIG" 2>&1)"; then
 fi
 
 jq -r --arg tail "$CDN_TAIL" \
-  '.[] | "vless://\(.id)@\($tail)#\(("nat全球-" + .name) | @uri)"' \
+  'to_entries[]
+   | .value as $endpoint
+   | (("000" + ((.key + 1) | tostring))[-3:]) as $number
+   | (if $endpoint.media
+      then ($endpoint.name | sub(($endpoint.country) + "$"; "")) as $media_name
+      | if $media_name == "" then $endpoint.country else ($endpoint.country + "-" + $media_name) end
+      else $endpoint.country
+      end) as $label
+   | "vless://\($endpoint.id)@\($tail)#\((($number + "-" + $label + "-nat全球-直连")) | @uri)"' \
   <<<"$MANAGED_ENDPOINTS" > "$TMP_SUB"
 FINAL_NODE_COUNT="$(awk 'NF {count++} END {print count + 0}' "$TMP_SUB")"
 EXPECTED_NODE_COUNT="$ENDPOINT_COUNT"
