@@ -245,9 +245,9 @@ ENDPOINTS_JSON="$(jq -c '
     elif .code == "amtv" then "in"
     else .code
     end;
-  ["us", "sg", "jp", "hk", "tw", "kr", "my", "ca", "au", "nz", "gb", "de", "fr", "nl", "mx", "br", "ar", "cl", "ch", "ae", "za", "is", "ng", "tr", "ua", "dk"] as $priority;
-  {"us": "美国", "sg": "新加坡", "jp": "日本", "hk": "香港", "tw": "台湾", "kr": "韩国", "my": "马来西亚", "ca": "加拿大", "au": "澳大利亚", "nz": "新西兰", "gb": "英国", "de": "德国", "fr": "法国", "nl": "荷兰", "mx": "墨西哥", "br": "巴西", "ar": "阿根廷", "cl": "智利", "ch": "瑞士", "ae": "阿联酋", "za": "南非", "is": "冰岛", "ng": "尼日利亚", "tr": "土耳其", "ua": "乌克兰", "dk": "丹麦", "cn": "中国"} as $country_names;
-  . as $all
+  ["us", "sg", "jp", "hk", "tw", "kr", "my", "ca", "au", "nz", "gb", "de", "fr", "nl", "mx", "br", "ar", "cl", "ch", "ae", "za", "is", "ng", "tr", "ua", "dk"] as $priority
+  | {"us": "美国", "sg": "新加坡", "jp": "日本", "hk": "香港", "tw": "台湾", "kr": "韩国", "my": "马来西亚", "ca": "加拿大", "au": "澳大利亚", "nz": "新西兰", "gb": "英国", "de": "德国", "fr": "法国", "nl": "荷兰", "mx": "墨西哥", "br": "巴西", "ar": "阿根廷", "cl": "智利", "ch": "瑞士", "ae": "阿联酋", "za": "南非", "is": "冰岛", "ng": "尼日利亚", "tr": "土耳其", "ua": "乌克兰", "dk": "丹麦", "cn": "中国"} as $country_names
+  | . as $all
   | ($all | map(.code) | to_entries | map({key: .value, value: .key}) | from_entries) as $source_rank
   | ($priority | to_entries | map({key: .value, value: .key}) | from_entries) as $priority_rank
   | map(. + {group: group_code})
