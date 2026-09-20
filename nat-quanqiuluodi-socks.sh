@@ -411,8 +411,11 @@ if [[ -e "$GLOBAL_SUB_FILE" ]]; then
 fi
 
 install -m 600 -- "$TMP_CONFIG" "$CONFIG_PATH"
-install -m 600 -- "$TMP_SUB" "$GLOBAL_SUB_FILE"
-install -m 600 -- "$TMP_SUB" "$GLOBAL_PLAIN_FILE"
+install -m 640 -- "$TMP_SUB" "$GLOBAL_SUB_FILE"
+install -m 640 -- "$TMP_SUB" "$GLOBAL_PLAIN_FILE"
+id nginx >/dev/null 2>&1 || die "找不到 Nginx 用户；请先运行 HTTPS 版本的 nat-oneclick 脚本"
+chown root:nginx "$GLOBAL_SUB_DIR" "$GLOBAL_SUB_FILE" "$GLOBAL_PLAIN_FILE" || die "无法设置全球订阅文件属主"
+chmod 750 "$GLOBAL_SUB_DIR"
 
 if ! restart_xray; then
   cp -p -- "$CONFIG_BACKUP" "$CONFIG_PATH"
