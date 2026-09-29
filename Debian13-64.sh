@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # Debian 13：按配置生成 Reality、CDN XHTTP-TLS 和 HY2 节点。
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.2"
 SCRIPT_NAME="$(basename "${0:-Debian13-64.sh}")"
 OUTPUT_DIR="/etc/xray"
 CONFIG_PATH="$OUTPUT_DIR/config.json"
@@ -552,8 +552,9 @@ build_nodes() {
           --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
           --arg auth "$password" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" \
           '{tag:$tag,listen:$listen,port:$port,protocol:"hysteria",
-            settings:{version:2,clients:[{auth:$auth}]},
-            streamSettings:{network:"hysteria",security:"tls",
+            settings:{version:2,users:[{auth:$auth}]},
+            streamSettings:{method:"hysteria",security:"tls",
+              hysteriaSettings:{version:2},
               tlsSettings:{alpn:["h3"],certificates:[{certificateFile:$cert,keyFile:$key}]}}}')" || die "节点 $index 的 HY2 配置生成失败"
         NEW_INBOUNDS+=("$reality_json")
         outbound_json="$(jq -cn --arg tag "$outtag" --arg exit "$exit" --arg strategy "UseIPv${family}" \
@@ -832,4 +833,3 @@ main() {
 }
 
 main "$@"
-
