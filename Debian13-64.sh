@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # Debian 13：按配置生成 Reality、CDN XHTTP-TLS 和 HY2 节点。
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 SCRIPT_NAME="$(basename "${0:-Debian13-64.sh}")"
 OUTPUT_DIR="/etc/xray"
 CONFIG_PATH="$OUTPUT_DIR/config.json"
@@ -320,6 +320,7 @@ require_debian_13() {
 install_dependencies() {
   local -a packages=()
   local nginx_new=0
+  command_exists ip || packages+=(iproute2)
   command_exists jq || packages+=(jq)
   command_exists openssl || packages+=(openssl)
   command_exists sha256sum || packages+=(coreutils)
@@ -342,9 +343,29 @@ install_dependencies() {
   if (( nginx_new == 1 )); then
     systemctl disable --now nginx.service >/dev/null || die "无法停用新安装的默认 Nginx 服务"
   fi
-  command_exists jq && command_exists openssl &&
+  command_exists ip && command_exists jq && command_exists openssl &&
     command_exists curl && command_exists sha256sum && command_exists nginx &&
     { (( ${#HY2_IDS[@]} == 0 )) || command_exists nft; } || die "依赖安装完成后仍缺少必需工具"
+}
+
+require_local_addresses() {
+  local index field addr family bits found
+  for index in "${NODE_IDS[@]}"; do
+    [[ "${NODE_TYPES[$index]}" == REALITY || "${NODE_TYPES[$index]}" == HY2 ]] || continue
+    for field in ENTRY EXIT; do
+      if [[ "$field" == ENTRY ]]; then
+        addr="${NODE_ENTRY_IPS[$index]}"
+        family="${NODE_IP_FAMILIES[$index]}"
+      else
+        addr="${NODE_EXIT_IPS[$index]}"
+        family="${NODE_EXIT_FAMILIES[$index]}"
+      fi
+      if [[ "$family" == 6 ]]; then bits=128; else bits=32; fi
+      found="$(ip "-$family" -o address show to "$addr/$bits")" || die "无法检查节点 $index 的 ${field}_IP"
+      [[ -n "$found" ]] || die "节点 $index 的 ${field}_IP 尚未配置到本机：$addr；请先添加并设置重启后保留"
+      [[ "$found" != *tentative* && "$found" != *dadfailed* ]] || die "节点 $index 的 ${field}_IP 尚未就绪：$addr"
+    done
+  done
 }
 
 find_xray() {
@@ -497,6 +518,7 @@ build_nodes() {
         entry="${NODE_ENTRY_IPS[$index]}"
         exit="${NODE_EXIT_IPS[$index]}"
         family="${NODE_EXIT_FAMILIES[$index]}"
+        if [[ "${NODE_IP_FAMILIES[$index]}" == 6 ]]; then listen="::"; else listen="0.0.0.0"; fi
         uuid="$(cat /proc/sys/kernel/random/uuid)"
         short_id="$(openssl rand -hex 8)"
         KEY_OUTPUT="$("$XRAY_BIN" x25519 2>&1)" || die "节点 $index 的 Reality 密钥生成失败"
@@ -504,7 +526,7 @@ build_nodes() {
         public_key="$(extract_x25519_value public)"
         [[ -n "$private_key" && -n "$public_key" ]] || die "节点 $index 的 Reality 密钥格式无法识别"
         reality_json="$(jq -cn \
-          --arg tag "$tag" --arg listen "$entry" --argjson port "$port" \
+          --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
           --arg uuid "$uuid" --arg dest "$REALITY_DEST" --arg sni "$REALITY_SNI" \
           --arg private_key "$private_key" --arg short_id "$short_id" \
           '{tag:$tag,listen:$listen,port:$port,protocol:"vless",
@@ -523,17 +545,17 @@ build_nodes() {
         preferred="$(config_value "${prefix}_PREFERRED_DOMAIN")"
         origin="$(config_value "${prefix}_ORIGIN_DOMAIN")"
         origin_enc="$(urlencode "$origin")"
+        if [[ -s /proc/net/if_inet6 ]]; then listen="::"; else listen="0.0.0.0"; fi
         uuid="$(cat /proc/sys/kernel/random/uuid)"
         reality_json="$(jq -cn \
-          --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" \
-          --arg host "$origin" --arg path "$XHTTP_PATH" \
+          --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg uuid "$uuid" \
+          --arg path "$XHTTP_PATH" \
           --arg cert "$CERT_FILE" --arg key "$KEY_FILE" \
-          '{tag:$tag,port:$port,protocol:"vless",
+          '{tag:$tag,listen:$listen,port:$port,protocol:"vless",
             settings:{clients:[{id:$uuid}],decryption:"none"},
             streamSettings:{network:"xhttp",security:"tls",
-              xhttpSettings:{host:$host,path:$path,mode:"auto"},
-              tlsSettings:{minVersion:"1.2",maxVersion:"1.3",
-                alpn:["h2","h3","http/1.1"],
+              xhttpSettings:{path:$path,mode:"auto"},
+              tlsSettings:{alpn:["h2","http/1.1"],
                 certificates:[{certificateFile:$cert,keyFile:$key}]}}}')" || die "节点 $index 的 CDN 配置生成失败"
         NEW_INBOUNDS+=("$reality_json")
         outbound_json="$(jq -cn --arg tag "$outtag" \
@@ -677,6 +699,7 @@ EOF
   systemctl daemon-reload || die "systemd 配置加载失败"
   systemctl enable xray-yijian.service >/dev/null || die "无法启用 Xray 自启动"
   systemctl restart xray-yijian.service || die "Xray 启动失败"
+  sleep 1
   systemctl is-active --quiet xray-yijian.service || die "Xray 服务没有运行"
 }
 
@@ -802,6 +825,7 @@ main() {
   validate_deployment_config
   TMP_DIR="$(mktemp -d /tmp/xray-yijian.XXXXXX)" || die "无法创建临时目录"
   install_dependencies
+  require_local_addresses
   XRAY_BIN="$(find_xray || true)"
   if [[ -z "$XRAY_BIN" ]]; then
     install_xray
