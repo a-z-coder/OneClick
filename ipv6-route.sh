@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION=1.0.2
+VERSION=1.0.3
 CONFIG_DIR=/etc/ipv6-route-setup
 CONFIG_FILE=$CONFIG_DIR/addresses.list
 INSTALLED_SCRIPT=/usr/local/sbin/ipv6-route-setup
@@ -24,11 +24,6 @@ require_host() {
   [[ ${ID:-} == debian && ${VERSION_ID:-} == 13 ]] || die '仅支持 Debian 13。'
   command -v ip >/dev/null 2>&1 || die '缺少 ip 命令，请先安装 iproute2。'
   command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || die '需要 systemd。'
-}
-
-require_install_source() {
-  [[ -f ${BASH_SOURCE[0]} && -s ${BASH_SOURCE[0]} ]] ||
-    die '请先把脚本保存为文件再运行；从管道运行无法安装开机服务。'
 }
 
 valid_ip() {
@@ -124,11 +119,17 @@ write_config() {
 }
 
 install_service() {
-  if [[ $(readlink -f -- "${BASH_SOURCE[0]}") != "$INSTALLED_SCRIPT" ]]; then
-    install -m 755 -- "${BASH_SOURCE[0]}" "$INSTALLED_SCRIPT"
-  fi
-  [[ -s $INSTALLED_SCRIPT ]] || die '安装后的脚本为空。'
-  /bin/bash -n "$INSTALLED_SCRIPT" || die '安装后的脚本有语法错误。'
+  local tmp
+  install -d -m 755 "${INSTALLED_SCRIPT%/*}"
+  tmp=$(mktemp "${INSTALLED_SCRIPT}.XXXXXXXX") || die '无法创建开机服务脚本。'
+  {
+    printf '#!/bin/bash\nset -Eeuo pipefail\nCONFIG_FILE=%q\numask 077\n' "$CONFIG_FILE"
+    declare -f die require_host valid_ip valid_iface load_config address_state rollback_added apply_list apply_addresses
+    printf '\nrequire_host\napply_addresses\n'
+  } > "$tmp" || die '无法生成开机服务脚本。'
+  /bin/bash -n "$tmp" || die '开机服务脚本有语法错误。'
+  chmod 755 "$tmp"
+  mv -f -- "$tmp" "$INSTALLED_SCRIPT"
   cat > "$SERVICE_FILE" <<'EOF'
 [Unit]
 Description=Restore extra IPv6 addresses for nodes
@@ -138,7 +139,7 @@ Before=xray-yijian.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash /usr/local/sbin/ipv6-route-setup apply
+ExecStart=/bin/bash /usr/local/sbin/ipv6-route-setup
 RemainAfterExit=yes
 
 [Install]
@@ -159,7 +160,7 @@ configure() {
   local address=''
   local -a requested=()
   local -A known=()
-  require_install_source
+  [[ -t 0 ]] || die '输入 IPv6 需要交互终端；请使用进程替换或先保存脚本后运行。'
   detect_iface
   if [[ -f $CONFIG_FILE ]]; then
     load_config
@@ -198,7 +199,6 @@ finish_setup() {
 }
 
 repair() {
-  require_install_source
   load_config
   apply_list
   finish_setup
@@ -230,5 +230,5 @@ case ${1:-} in
   apply) apply_addresses ;;
   repair) repair ;;
   status) show_status ;;
-  *) die '用法：bash ipv6-route.sh [install|repair|status]。' ;;
+  *) die '用法：不带参数进行配置；可选命令为 install、repair、status。' ;;
 esac
