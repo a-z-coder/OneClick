@@ -8,7 +8,7 @@ fi
 set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="2.1.4"
+SCRIPT_VERSION="2.1.5"
 OUTPUT_DIR="/etc/xray"
 CONFIG_PATH="$OUTPUT_DIR/config.json"
 SUB_ROOT="$OUTPUT_DIR/xray-sub"
@@ -163,7 +163,7 @@ install_dependencies() {
   fi
 }
 
-install_xray() { local asset archive extract_dir; case "$(uname -m)" in x86_64|amd64) asset=Xray-linux-64.zip;; aarch64|arm64) asset=Xray-linux-arm64-v8a.zip;; *) die "当前架构不受 Xray 支持";; esac; archive="$(mktemp /tmp/xray.XXXXXX.zip)"; extract_dir="$(mktemp -d /tmp/xray-core.XXXXXX)"; if command_exists curl; then curl -fL "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" -o "$archive" || die "下载 Xray 失败"; else wget -O "$archive" "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" || die "下载 Xray 失败"; fi; unzip -j "$archive" xray -d "$extract_dir" >/dev/null || die "解压 Xray 失败"; install -m 755 "$extract_dir/xray" /usr/local/bin/xray || die "安装 Xray 失败"; rm -f "$archive" "$extract_dir/xray"; rmdir "$extract_dir" 2>/dev/null || true; XRAY_BIN=/usr/local/bin/xray; "$XRAY_BIN" version >/dev/null 2>&1 || die "安装后的 Xray 无法运行"; }
+install_xray() { local asset archive extract_dir; case "$(uname -m)" in x86_64|amd64) asset=Xray-linux-64.zip;; aarch64|arm64) asset=Xray-linux-arm64-v8a.zip;; *) die "当前架构不受 Xray 支持";; esac; archive="$(mktemp /tmp/xray.XXXXXX)"; extract_dir="$(mktemp -d /tmp/xray-core.XXXXXX)"; if command_exists curl; then curl -fL "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" -o "$archive" || die "下载 Xray 失败"; else wget -O "$archive" "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" || die "下载 Xray 失败"; fi; unzip -j "$archive" xray -d "$extract_dir" >/dev/null || die "解压 Xray 失败"; install -m 755 "$extract_dir/xray" /usr/local/bin/xray || die "安装 Xray 失败"; rm -f "$archive" "$extract_dir/xray"; rmdir "$extract_dir" 2>/dev/null || true; XRAY_BIN=/usr/local/bin/xray; "$XRAY_BIN" version >/dev/null 2>&1 || die "安装后的 Xray 无法运行"; }
 
 prepare_certificate() {
   local cert_pub key_pub domain index; printf '%s\n' "$CERT_CONTENT" > "$TMP_DIR/cert.pem"; printf '%s\n' "$KEY_CONTENT" > "$TMP_DIR/key.pem"; openssl x509 -in "$TMP_DIR/cert.pem" -noout >/dev/null 2>&1 || die "证书不是有效 PEM X.509"; openssl pkey -in "$TMP_DIR/key.pem" -passin pass: -noout >/dev/null 2>&1 || die "私钥无效或带密码"; if [[ "$SUBSCRIPTION_MODE" == DOMAIN ]]; then openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkhost "$SUB_DOMAIN" >/dev/null 2>&1 || die "证书不包含订阅域名"; fi; for index in "${NODE_IDS[@]}"; do case "${NODE_TYPES[$index]}" in CDN) domain="$(config_value "NODE_${index}_ORIGIN_DOMAIN")";; HY2) domain="$(config_value "NODE_${index}_SNI")";; *) continue;; esac; openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkhost "$domain" >/dev/null 2>&1 || die "证书不包含节点 $index 的域名"; done; cert_pub="$(openssl x509 -in "$TMP_DIR/cert.pem" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; key_pub="$(openssl pkey -in "$TMP_DIR/key.pem" -passin pass: -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || die "证书和私钥不匹配"; CERT_SHA256="$(openssl x509 -in "$TMP_DIR/cert.pem" -outform DER | sha256sum | awk '{print $1}')"; CERT_FILE="$OUTPUT_DIR/yijian-origin-cert.pem"; KEY_FILE="$OUTPUT_DIR/yijian-origin-key.pem"; install -m 600 "$TMP_DIR/cert.pem" "$CERT_FILE"; install -m 600 "$TMP_DIR/key.pem" "$KEY_FILE";
