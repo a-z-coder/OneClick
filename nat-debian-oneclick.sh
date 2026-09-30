@@ -8,7 +8,7 @@ fi
 set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.4"
 OUTPUT_DIR="/etc/xray"
 CONFIG_PATH="$OUTPUT_DIR/config.json"
 SUB_ROOT="$OUTPUT_DIR/xray-sub"
@@ -130,7 +130,7 @@ validate_deployment_config() {
   case "$subscription_mode" in
     NONE) for key in SUB_DOMAIN SUB_IP SUB_PORT SUB_TOKEN; do [[ -z "${CONFIG_VALUES[$key]+x}" ]] || die "SUBSCRIPTION_MODE=NONE 时不能配置 $key"; done;;
     DOMAIN) [[ -z "${CONFIG_VALUES[SUB_IP]+x}" ]] || die "DOMAIN 模式不使用 SUB_IP"; SUB_DOMAIN="$(required_value SUB_DOMAIN)"; SUB_PORT="$(required_value SUB_PORT)"; SUB_TOKEN="$(required_value SUB_TOKEN)"; validate_domain "订阅域名" "$SUB_DOMAIN"; validate_port "HTTPS 订阅端口" "$SUB_PORT"; SUB_HOST="$SUB_DOMAIN"; SUBSCRIPTION_ENABLED=1; CERT_REQUIRED=1;;
-    IP) [[ -z "${CONFIG_VALUES[SUB_DOMAIN]+x}" ]] || die "IP 模式不使用 SUB_DOMAIN"; SUB_IP="$(required_value SUB_IP)"; SUB_PORT="$(required_value SUB_PORT)"; SUB_TOKEN="$(required_value SUB_TOKEN)"; SUB_HOST_FAMILY="$(ip_family "$SUB_IP")" || die "订阅 IP 无效"; validate_port "HTTPS 订阅端口" "$SUB_PORT"; SUB_HOST="$SUB_IP"; SUBSCRIPTION_ENABLED=1; CERT_REQUIRED=1;;
+    IP) [[ -z "${CONFIG_VALUES[SUB_DOMAIN]+x}" ]] || die "IP 模式不使用 SUB_DOMAIN"; SUB_IP="$(required_value SUB_IP)"; SUB_PORT="$(required_value SUB_PORT)"; SUB_TOKEN="$(required_value SUB_TOKEN)"; SUB_HOST_FAMILY="$(ip_family "$SUB_IP")" || die "订阅 IP 无效"; validate_port "HTTP 订阅端口" "$SUB_PORT"; SUB_HOST="$SUB_IP"; SUBSCRIPTION_ENABLED=1;;
     *) die "SUBSCRIPTION_MODE 只能是 NONE、DOMAIN 或 IP";;
   esac
   SUBSCRIPTION_MODE="$subscription_mode"; (( CERT_REQUIRED == 0 )) || [[ -n "$CERT_CONTENT" && -n "$KEY_CONTENT" ]] || die "当前配置需要同时提供证书和私钥"
@@ -166,7 +166,7 @@ install_dependencies() {
 install_xray() { local asset archive extract_dir; case "$(uname -m)" in x86_64|amd64) asset=Xray-linux-64.zip;; aarch64|arm64) asset=Xray-linux-arm64-v8a.zip;; *) die "当前架构不受 Xray 支持";; esac; archive="$(mktemp /tmp/xray.XXXXXX.zip)"; extract_dir="$(mktemp -d /tmp/xray-core.XXXXXX)"; if command_exists curl; then curl -fL "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" -o "$archive" || die "下载 Xray 失败"; else wget -O "$archive" "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" || die "下载 Xray 失败"; fi; unzip -j "$archive" xray -d "$extract_dir" >/dev/null || die "解压 Xray 失败"; install -m 755 "$extract_dir/xray" /usr/local/bin/xray || die "安装 Xray 失败"; rm -f "$archive" "$extract_dir/xray"; rmdir "$extract_dir" 2>/dev/null || true; XRAY_BIN=/usr/local/bin/xray; "$XRAY_BIN" version >/dev/null 2>&1 || die "安装后的 Xray 无法运行"; }
 
 prepare_certificate() {
-  local cert_pub key_pub domain index; printf '%s\n' "$CERT_CONTENT" > "$TMP_DIR/cert.pem"; printf '%s\n' "$KEY_CONTENT" > "$TMP_DIR/key.pem"; openssl x509 -in "$TMP_DIR/cert.pem" -noout >/dev/null 2>&1 || die "证书不是有效 PEM X.509"; openssl pkey -in "$TMP_DIR/key.pem" -passin pass: -noout >/dev/null 2>&1 || die "私钥无效或带密码"; if [[ "$SUBSCRIPTION_MODE" == DOMAIN ]]; then openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkhost "$SUB_DOMAIN" >/dev/null 2>&1 || die "证书不包含订阅域名"; elif [[ "$SUBSCRIPTION_MODE" == IP ]]; then openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkip "$SUB_IP" >/dev/null 2>&1 || die "证书不包含订阅 IP"; fi; for index in "${NODE_IDS[@]}"; do case "${NODE_TYPES[$index]}" in CDN) domain="$(config_value "NODE_${index}_ORIGIN_DOMAIN")";; HY2) domain="$(config_value "NODE_${index}_SNI")";; *) continue;; esac; openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkhost "$domain" >/dev/null 2>&1 || die "证书不包含节点 $index 的域名"; done; cert_pub="$(openssl x509 -in "$TMP_DIR/cert.pem" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; key_pub="$(openssl pkey -in "$TMP_DIR/key.pem" -passin pass: -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || die "证书和私钥不匹配"; CERT_SHA256="$(openssl x509 -in "$TMP_DIR/cert.pem" -outform DER | sha256sum | awk '{print $1}')"; CERT_FILE="$OUTPUT_DIR/yijian-origin-cert.pem"; KEY_FILE="$OUTPUT_DIR/yijian-origin-key.pem"; install -m 600 "$TMP_DIR/cert.pem" "$CERT_FILE"; install -m 600 "$TMP_DIR/key.pem" "$KEY_FILE";
+  local cert_pub key_pub domain index; printf '%s\n' "$CERT_CONTENT" > "$TMP_DIR/cert.pem"; printf '%s\n' "$KEY_CONTENT" > "$TMP_DIR/key.pem"; openssl x509 -in "$TMP_DIR/cert.pem" -noout >/dev/null 2>&1 || die "证书不是有效 PEM X.509"; openssl pkey -in "$TMP_DIR/key.pem" -passin pass: -noout >/dev/null 2>&1 || die "私钥无效或带密码"; if [[ "$SUBSCRIPTION_MODE" == DOMAIN ]]; then openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkhost "$SUB_DOMAIN" >/dev/null 2>&1 || die "证书不包含订阅域名"; fi; for index in "${NODE_IDS[@]}"; do case "${NODE_TYPES[$index]}" in CDN) domain="$(config_value "NODE_${index}_ORIGIN_DOMAIN")";; HY2) domain="$(config_value "NODE_${index}_SNI")";; *) continue;; esac; openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkhost "$domain" >/dev/null 2>&1 || die "证书不包含节点 $index 的域名"; done; cert_pub="$(openssl x509 -in "$TMP_DIR/cert.pem" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; key_pub="$(openssl pkey -in "$TMP_DIR/key.pem" -passin pass: -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || die "证书和私钥不匹配"; CERT_SHA256="$(openssl x509 -in "$TMP_DIR/cert.pem" -outform DER | sha256sum | awk '{print $1}')"; CERT_FILE="$OUTPUT_DIR/yijian-origin-cert.pem"; KEY_FILE="$OUTPUT_DIR/yijian-origin-key.pem"; install -m 600 "$TMP_DIR/cert.pem" "$CERT_FILE"; install -m 600 "$TMP_DIR/key.pem" "$KEY_FILE";
 }
 
 extract_x25519_value() { local kind="$1"; printf '%s\n' "$KEY_OUTPUT" | awk -v kind="$kind" 'function emit(v){gsub(/\r/,"",v);gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);if(v!=""){print v;exit}}{for(i=1;i<=NF;i++){t=$i;if(kind=="private"){if(t=="PrivateKey:"&&i<NF)emit($(i+1));if(t~/^PrivateKey:[^[:space:]]+$/){sub(/^PrivateKey:/,"",t);emit(t)};if(t=="Private"&&i<NF){n=$(i+1);if(n=="key:"&&i+1<NF)emit($(i+2));if(n~/^key:[^[:space:]]+$/){sub(/^key:/,"",n);emit(n)}}}else{if(t=="Password"&&i<NF){n=$(i+1);if(n=="(PublicKey):"&&i+1<NF)emit($(i+2));if(n~/^\(PublicKey\):[^[:space:]]+$/){sub(/^\(PublicKey\):/,"",n);emit(n)}};if(t=="Password:"&&i<NF)emit($(i+1));if(t~/^Password:[^[:space:]]+$/){sub(/^Password:/,"",t);emit(t)};if(t=="PublicKey:"&&i<NF)emit($(i+1));if(t~/^PublicKey:[^[:space:]]+$/){sub(/^PublicKey:/,"",t);emit(t)};if(t=="Public"&&i<NF){n=$(i+1);if(n=="key:"&&i+1<NF)emit($(i+2));if(n~/^key:[^[:space:]]+$/){sub(/^key:/,"",n);emit(n)}}}}}' ; }
@@ -300,15 +300,20 @@ write_subscription_files() {
   SUB_DIR="$SUB_ROOT/$SUB_TOKEN"; SUB_FILE="$SUB_DIR/jhsub.txt"; mkdir -p -- "$SUB_DIR"
   printf '%s\n' "${NODE_LINES[@]}" > "$OUTPUT_DIR/vless-links.txt"; printf '%s\n' "${NODE_LINES[@]}" > "$SUB_FILE"
   chmod 600 "$OUTPUT_DIR/vless-links.txt"; chmod 640 "$SUB_FILE"; id "$NGINX_USER" >/dev/null 2>&1 || die "找不到 Nginx 运行用户"; chown "root:$NGINX_GROUP" "$SUB_ROOT" "$SUB_DIR" "$SUB_FILE" || die "无法设置订阅文件属主"; chmod 750 "$SUB_ROOT" "$SUB_DIR"
-  if [[ "$SUBSCRIPTION_MODE" == IP ]]; then SUB_URL_HOST="$(url_host "$SUB_IP")"; else SUB_URL_HOST="$SUB_DOMAIN"; fi
-  if [[ "$SUB_PORT" == 443 ]]; then SUB_URL="https://${SUB_URL_HOST}/${SUB_TOKEN}/jhsub.txt"; else SUB_URL="https://${SUB_URL_HOST}:${SUB_PORT}/${SUB_TOKEN}/jhsub.txt"; fi
+  if [[ "$SUBSCRIPTION_MODE" == IP ]]; then SUB_URL_HOST="$(url_host "$SUB_IP")"; SUB_URL_SCHEME=http; else SUB_URL_HOST="$SUB_DOMAIN"; SUB_URL_SCHEME=https; fi
+  if [[ "$SUB_PORT" == 443 && "$SUB_URL_SCHEME" == https ]]; then SUB_URL="${SUB_URL_SCHEME}://${SUB_URL_HOST}/${SUB_TOKEN}/jhsub.txt"; else SUB_URL="${SUB_URL_SCHEME}://${SUB_URL_HOST}:${SUB_PORT}/${SUB_TOKEN}/jhsub.txt"; fi
   printf '%s\n' "$SUB_URL" > "$OUTPUT_DIR/yijian-subscription-url.txt"; printf '%s\n' "$SUB_PORT" > "$OUTPUT_DIR/yijian-subscription-port.txt"; printf '%s\n' "$SUB_TOKEN" > "$OUTPUT_DIR/yijian-subscription-token.txt"; printf '%s\n' "$SUB_ROOT" > "$OUTPUT_DIR/yijian-subscription-root.txt"; chmod 600 "$OUTPUT_DIR"/yijian-subscription-*.txt
 }
 
 write_subscription_nginx_config() {
-  local listen_address="0.0.0.0" ipv6_listen="" server_name="$SUB_DOMAIN"
+  local listen_address="0.0.0.0" ipv6_listen="" server_name="$SUB_DOMAIN" listen_suffix=" ssl" tls_config=""
   [[ "$SUBSCRIPTION_MODE" == IP ]] && server_name=_
-  [[ -s /proc/net/if_inet6 ]] && ipv6_listen="        listen [::]:$SUB_PORT ssl;"
+  if [[ "$SUBSCRIPTION_MODE" == DOMAIN ]]; then
+    tls_config="$(printf '%s\n' "    ssl_certificate $CERT_FILE;" "    ssl_certificate_key $KEY_FILE;" "    ssl_protocols TLSv1.2 TLSv1.3;")"
+  else
+    listen_suffix=""
+  fi
+  [[ -s /proc/net/if_inet6 ]] && ipv6_listen="        listen [::]:$SUB_PORT$listen_suffix;"
   SUB_NGINX_CONF="$OUTPUT_DIR/yijian-subscription-nginx.conf"; SUB_NGINX_PID="/run/xray-yijian-sub-nginx.pid"
   cat > "$SUB_NGINX_CONF" <<EOF
 user $NGINX_USER;
@@ -322,18 +327,16 @@ http {
   sendfile on;
   keepalive_timeout 15;
   server {
-    listen $listen_address:$SUB_PORT ssl;
+    listen $listen_address:$SUB_PORT$listen_suffix;
 $ipv6_listen
     server_name $server_name;
-    ssl_certificate $CERT_FILE;
-    ssl_certificate_key $KEY_FILE;
-    ssl_protocols TLSv1.2 TLSv1.3;
+$tls_config
     location = /$SUB_TOKEN/jhsub.txt { root $SUB_ROOT; default_type text/plain; add_header Cache-Control "no-store" always; }
     location / { return 404; }
   }
 }
 EOF
-  chmod 600 "$SUB_NGINX_CONF"; "$NGINX_BIN" -t -c "$SUB_NGINX_CONF" >/dev/null 2>&1 || die "Nginx HTTPS 订阅配置检查失败"
+  chmod 600 "$SUB_NGINX_CONF"; "$NGINX_BIN" -t -c "$SUB_NGINX_CONF" >/dev/null 2>&1 || die "Nginx 订阅配置检查失败"
 }
 
 start_subscription_service() {
@@ -359,8 +362,8 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload || die "systemd 配置加载失败"
     systemctl enable xray-yijian-sub.service >/dev/null || die "无法启用订阅服务自启动"
-    systemctl restart xray-yijian-sub.service || die "HTTPS 订阅服务启动失败"
-    systemctl is-active --quiet xray-yijian-sub.service || die "HTTPS 订阅服务未运行"
+    systemctl restart xray-yijian-sub.service || die "订阅服务启动失败"
+    systemctl is-active --quiet xray-yijian-sub.service || die "订阅服务未运行"
     return
   fi
   rc-service xray-yijian-sub stop >/dev/null 2>&1 || true
@@ -375,24 +378,24 @@ depend() { need net; }
 EOF
   chmod 755 /etc/init.d/xray-yijian-sub
   rc-update add xray-yijian-sub default >/dev/null 2>&1 || die "无法启用订阅服务自启动"
-  rc-service xray-yijian-sub restart >/dev/null 2>&1 || rc-service xray-yijian-sub start >/dev/null 2>&1 || die "HTTPS 订阅服务启动失败"
-  rc-service xray-yijian-sub status >/dev/null 2>&1 || die "HTTPS 订阅服务未运行"
+  rc-service xray-yijian-sub restart >/dev/null 2>&1 || rc-service xray-yijian-sub start >/dev/null 2>&1 || die "订阅服务启动失败"
+  rc-service xray-yijian-sub status >/dev/null 2>&1 || die "订阅服务未运行"
 }
 
 stop_subscription_service() { if [[ "$SERVICE_MODE" == systemd ]]; then systemctl disable --now xray-yijian-sub.service >/dev/null 2>&1 || true; rm -f -- /etc/systemd/system/xray-yijian-sub.service; systemctl daemon-reload >/dev/null 2>&1 || true; else rc-service xray-yijian-sub stop >/dev/null 2>&1 || true; rc-update del xray-yijian-sub default >/dev/null 2>&1 || true; rm -f -- /etc/init.d/xray-yijian-sub; fi; rm -f -- "$OUTPUT_DIR"/yijian-subscription-*.txt "$OUTPUT_DIR/yijian-subscription-nginx.conf"; }
 verify_subscription() {
   local local_url response="" host_header="$SUB_DOMAIN"
-  if [[ "$SUBSCRIPTION_MODE" == IP ]]; then host_header="$SUB_IP"; [[ "$SUB_HOST_FAMILY" == 6 ]] && local_url="https://[::1]:$SUB_PORT/$SUB_TOKEN/jhsub.txt" || local_url="https://127.0.0.1:$SUB_PORT/$SUB_TOKEN/jhsub.txt"; else [[ "$SUB_PORT" == 443 ]] && local_url="https://$SUB_DOMAIN/$SUB_TOKEN/jhsub.txt" || local_url="https://$SUB_DOMAIN:$SUB_PORT/$SUB_TOKEN/jhsub.txt"; fi
+  if [[ "$SUBSCRIPTION_MODE" == IP ]]; then host_header="$SUB_IP"; [[ "$SUB_HOST_FAMILY" == 6 ]] && local_url="http://[::1]:$SUB_PORT/$SUB_TOKEN/jhsub.txt" || local_url="http://127.0.0.1:$SUB_PORT/$SUB_TOKEN/jhsub.txt"; else [[ "$SUB_PORT" == 443 ]] && local_url="https://$SUB_DOMAIN/$SUB_TOKEN/jhsub.txt" || local_url="https://$SUB_DOMAIN:$SUB_PORT/$SUB_TOKEN/jhsub.txt"; fi
   if command_exists curl; then
     if [[ "$SUBSCRIPTION_MODE" == DOMAIN ]]; then response="$(curl -fsSk --noproxy '*' --max-time 8 --resolve "$SUB_DOMAIN:$SUB_PORT:127.0.0.1" "$local_url" 2>/dev/null || true)"; else response="$(curl -fsSk --noproxy '*' --max-time 8 -H "Host: $host_header" "$local_url" 2>/dev/null || true)"; fi
   fi
-  [[ "$response" == vless://* || "$response" == hysteria2://* ]] || die "本机 HTTPS 订阅检查失败"
+  [[ "$response" == vless://* || "$response" == hysteria2://* ]] || die "本机订阅检查失败"
 }
 
 show_port_usage() { if command_exists ss; then ss -lntup; elif command_exists netstat; then netstat -lntup; else printf '未找到 ss 或 netstat，无法显示端口占用\n'; fi; }
 show_deployment() {
   local output_dir="${1:-$OUTPUT_DIR}" line count=0 url_file="$output_dir/yijian-subscription-url.txt"; [[ -s "$output_dir/vless-links.txt" ]] || die "找不到已生成的节点文件"
-  while IFS= read -r line; do [[ -n "$line" ]] || continue; count=$((count+1)); printf '节点 %s：%s\n' "$count" "$line"; done < "$output_dir/vless-links.txt"; printf '节点总数：%s\n' "$count"; if [[ -s "$url_file" ]]; then printf 'HTTPS 订阅：%s\n' "$(sed -n '1p' "$url_file")"; else printf 'HTTPS 订阅：未启用\n'; fi; show_port_usage
+  while IFS= read -r line; do [[ -n "$line" ]] || continue; count=$((count+1)); printf '节点 %s：%s\n' "$count" "$line"; done < "$output_dir/vless-links.txt"; printf '节点总数：%s\n' "$count"; if [[ -s "$url_file" ]]; then printf '订阅：%s\n' "$(sed -n '1p' "$url_file")"; else printf '订阅：未启用\n'; fi; show_port_usage
 }
 
 main() {
@@ -416,7 +419,7 @@ main() {
   start_xray_service
   printf '%s\n' "${NODE_LINES[@]}" > "$OUTPUT_DIR/vless-links.txt"; chmod 600 "$OUTPUT_DIR/vless-links.txt"
   if (( SUBSCRIPTION_ENABLED == 1 )); then write_subscription_files; start_subscription_service; verify_subscription; else stop_subscription_service; fi
-  if (( SUBSCRIPTION_ENABLED == 1 )); then ok "${#NODE_IDS[@]} 个节点和 HTTPS 订阅已部署"; else ok "${#NODE_IDS[@]} 个节点已部署，HTTPS 订阅未启用"; fi
+  if (( SUBSCRIPTION_ENABLED == 1 )); then ok "${#NODE_IDS[@]} 个节点和订阅服务已部署"; else ok "${#NODE_IDS[@]} 个节点已部署，订阅未启用"; fi
   printf '%s\n' "${NODE_LINES[@]}"
   (( SUBSCRIPTION_ENABLED == 1 )) && printf '订阅网址：%s\n' "$SUB_URL" || printf '订阅网址：未启用\n'
   for index in "${HY2_IDS[@]}"; do printf '节点 %s 的 HY2 UDP 跳跃范围：%s:%s\n' "$index" "${NODE_HY2_STARTS[$index]}" "${NODE_HY2_ENDS[$index]}"; done
