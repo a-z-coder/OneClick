@@ -1,419 +1,269 @@
 #!/bin/sh
-# 全新 Alpine 默认可能没有 Bash；先用 POSIX sh 安装并切换到 Bash。
 if [ -z "${BASH_VERSION:-}" ]; then
-  if command -v bash >/dev/null 2>&1; then
-    exec bash "$0" "$@"
-  elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache bash || {
-      echo "[失败] Alpine Bash 安装失败，无法继续运行脚本" >&2
-      exit 1
-    }
-    exec bash "$0" "$@"
-  else
-    echo "[失败] 本脚本需要 Bash；当前系统既没有 Bash，也无法使用 apk 自动安装" >&2
-    exit 1
-  fi
+  if command -v bash >/dev/null 2>&1; then exec bash "$0" "$@"; fi
+  if command -v apk >/dev/null 2>&1; then apk add --no-cache bash || exit 1; exec bash "$0" "$@"; fi
+  echo "[失败] 本脚本需要 Bash；当前系统没有 Bash，也无法使用 apk 安装" >&2
+  exit 1
 fi
-
 set -Eeuo pipefail
 
-# 独立 Xray 一键配置脚本
-# 功能：
-#   1. 生成 VLESS-TCP-Reality-Vision 入站；
-#   2. 生成 VLESS-XHTTP-TLS 入站；
-#   3. 按配置中的每个优选域名生成一个 XHTTP-TLS 客户端节点；
-#   4. 按配置中的顺序生成节点，并设置整体 IPv4/IPv6 出站；
-#   5. 使用同一源站域名提供 HTTPS 订阅；订阅端口与 Xray 端口分开。
-#   6. 写入配置并按当前系统的服务方式启动 Xray 和订阅服务。
-#
-# 本脚本不依赖 Argosbx，也不会申请或续期证书。
-# 证书、私钥、橙云源站域名、订阅域名、优选域名和端口均由使用者输入。
-# ORIGIN_DOMAIN 用于 XHTTP；SUB_DOMAIN 用于 HTTPS 订阅，两者可以相同但通常建议分开。
-
 SCRIPT_NAME="$(basename "$0")"
-MANAGED_REALITY_TAG="vless-reality-vision"
-MANAGED_XHTTP_TAG="vless-xhttp-tls"
-
+SCRIPT_VERSION="2.0.0"
+OUTPUT_DIR="/etc/xray"
+CONFIG_PATH="$OUTPUT_DIR/config.json"
+SUB_ROOT="$OUTPUT_DIR/xray-sub"
 TMP_DIR=""
-CONFIG_PATH=""
-NODE_ORDER=""
-NODE_ORDER_IDS=()
-declare -A NODE_ORDER_SEEN=()
-OUTBOUND_IP_VERSION=""
-OUTBOUND_DOMAIN_STRATEGY=""
+XRAY_BIN=""
 NGINX_BIN=""
-SUB_NGINX_CONF=""
-SUB_NGINX_PID=""
-SUB_NGINX_ERROR_LOG=""
+NGINX_USER="nginx"
+NGINX_GROUP="nginx"
+SERVICE_MODE=""
+PACKAGE_MANAGER=""
+BASE_CONFIG=""
+TMP_CONFIG=""
+CERT_FILE=""
+KEY_FILE=""
+CERT_SHA256=""
+CONFIG_INPUT=""
+CERT_CONTENT=""
+KEY_CONTENT=""
+SUBSCRIPTION_MODE="NONE"
+SUBSCRIPTION_ENABLED=0
+CERT_REQUIRED=0
+SUB_DOMAIN=""
+SUB_IP=""
+SUB_PORT=""
+SUB_TOKEN=""
+SUB_HOST=""
+SUB_HOST_FAMILY=""
+SUB_URL=""
+SUB_DIR=""
+SUB_FILE=""
+XHTTP_PATH=""
+REALITY_SNI="apple.com"
+REALITY_DEST="apple.com:443"
+declare -A CONFIG_VALUES=()
+declare -a NODE_IDS=() NODE_TYPES=() NODE_PORTS=() NODE_ENTRY_IPS=() NODE_EXIT_IPS=()
+declare -a NODE_NAMES=() NODE_IP_FAMILIES=() NODE_EXIT_FAMILIES=()
+declare -a NODE_HY2_STARTS=() NODE_HY2_ENDS=() NODE_HY2_PASSWORDS=()
+declare -a HY2_IDS=() NODE_LINES=() NEW_INBOUNDS=() NEW_OUTBOUNDS=() NEW_RULES=()
 
-cleanup() {
-  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
-    rm -f -- "$TMP_DIR"/* 2>/dev/null || true
-    rmdir -- "$TMP_DIR" 2>/dev/null || true
-  fi
-}
+cleanup() { [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]] || { rm -f -- "$TMP_DIR"/* 2>/dev/null || true; rmdir -- "$TMP_DIR" 2>/dev/null || true; }; }
 trap cleanup EXIT
-
-die() {
-  echo "[失败] $*" >&2
-  exit 1
-}
-
-info() {
-  echo "[信息] $*"
-}
-
-ok() {
-  echo "[成功] $*"
-}
-
-warn() {
-  echo "[警告] $*" >&2
-}
-
-command_exists() {
-  command -v "$1" >/dev/null 2>&1
-}
-
-# 一键部署所需的少量基础工具；只在缺少依赖时安装。
-install_dependencies() {
-  local nginx_ready=0
-  find_nginx_runner && nginx_ready=1 || true
-
-  if command_exists jq && command_exists openssl && command_exists unzip && \
-      command_exists sha256sum && { command_exists curl || command_exists wget; } && \
-      [[ "$nginx_ready" -eq 1 ]]; then
-    return 0
-  fi
-
-  echo "[信息] 正在安装 Xray 和 HTTPS 订阅所需的基础工具"
-  if command_exists apk; then
-    apk add --no-cache jq openssl unzip coreutils curl ca-certificates nginx || die "Alpine 基础工具安装失败"
-  elif command_exists apt-get; then
-    DEBIAN_FRONTEND=noninteractive apt-get update || die "APT 软件源更新失败"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y jq openssl unzip coreutils curl ca-certificates nginx || die "Debian/Ubuntu 基础工具安装失败"
-  elif command_exists dnf; then
-    dnf install -y jq openssl unzip coreutils curl ca-certificates nginx || die "DNF 基础工具安装失败"
-  elif command_exists yum; then
-    yum install -y jq openssl unzip coreutils curl ca-certificates nginx || die "YUM 基础工具安装失败"
-  else
-    die "不支持当前软件包管理器，无法自动安装基础工具"
-  fi
-
-  command_exists jq || die "安装后仍未找到 jq"
-  command_exists openssl || die "安装后仍未找到 openssl"
-  command_exists unzip || die "安装后仍未找到 unzip"
-  command_exists curl || command_exists wget || die "安装后仍未找到 curl 或 wget"
-  find_nginx_runner || true
-  [[ -n "${NGINX_BIN:-}" ]] || die "安装后仍未找到可用的 Nginx HTTPS 服务"
-  ok "基础工具安装完成"
-}
-
-# 一次性读取固定格式的部署配置，兼容浏览器复制的纯文本内容。
-read_deployment_config() {
-  local config_line preferred_index preferred_domain
-  echo "请粘贴完整配置（从 YIjian_CONFIG_BEGIN 到 YIjian_CONFIG_END），然后回车：" >&2
-  CONFIG_INPUT="$(awk '
-    {
-      sub(/\r$/, "")
-      if ($0 == "```" || $0 == "YIjian_CONFIG_BEGIN") { if ($0 == "YIjian_CONFIG_BEGIN") started = 1; next }
-      if ($0 == "YIjian_CONFIG_END") {
-        if (started) found = 1
-        exit
-      }
-      if (started) print
-    }
-    END { if (!started || !found) exit 1 }
-  ')" || die "未读取到完整配置，必须包含 YIjian_CONFIG_BEGIN 和 YIjian_CONFIG_END"
-  [[ -n "$CONFIG_INPUT" ]] || die "部署配置不能为空"
-
-  REALITY_PORT="$(config_value REALITY_PORT)"
-  ORIGIN_DOMAIN="$(normalize_domain_value "$(config_value ORIGIN_DOMAIN)")"
-  SUB_DOMAIN="$(normalize_domain_value "$(config_value SUB_DOMAIN)")"
-  NODE_ORDER="$(trim_value "$(config_value NODE_ORDER)")"
-  OUTBOUND_IP_VERSION="$(trim_value "$(config_value OUTBOUND_IP_VERSION)")"
-  PREFERRED_DOMAINS=()
-  declare -A PREFERRED_DOMAIN_VALUES=()
-  while IFS= read -r config_line; do
-    config_line="${config_line#"${config_line%%[![:space:]]*}"}"
-    if [[ "$config_line" =~ ^PREFERRED_DOMAIN_([1-9][0-9]*)=(.*)$ ]]; then
-      PREFERRED_DOMAIN_VALUES["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
-    fi
-  done <<< "$CONFIG_INPUT"
-  if (( ${#PREFERRED_DOMAIN_VALUES[@]} > 0 )); then
-    while IFS= read -r preferred_index; do
-      # CDN 优选项只接受纯域名；URL 或 Markdown 链接应直接在校验阶段报错。
-      preferred_domain="$(trim_value "${PREFERRED_DOMAIN_VALUES[$preferred_index]}")"
-      [[ -n "$preferred_domain" ]] || die "PREFERRED_DOMAIN_${preferred_index} 为空"
-      PREFERRED_DOMAINS+=("$preferred_domain")
-    done < <(printf '%s\n' "${!PREFERRED_DOMAIN_VALUES[@]}" | sort -n)
-  fi
-  XHTTP_PORT="$(config_value XHTTP_PORT)"
-  SUB_PORT="$(config_value SUB_PORT)"
-  NODE_NAME_PREFIX="$(trim_value "$(config_value NODE_NAME_PREFIX)")"
-  CERT_CONTENT="$(extract_pem_block CERTIFICATE_BEGIN CERTIFICATE_END)"
-  KEY_CONTENT="$(extract_pem_block PRIVATE_KEY_BEGIN PRIVATE_KEY_END)"
-
-  [[ -n "$REALITY_PORT" ]] || die "配置中缺少 REALITY_PORT：vless直连端口"
-  [[ -n "$ORIGIN_DOMAIN" ]] || die "配置中缺少 ORIGIN_DOMAIN：优选自己域名"
-  [[ -n "$SUB_DOMAIN" ]] || die "配置中缺少 SUB_DOMAIN：HTTPS 订阅域名"
-  [[ -n "$NODE_ORDER" ]] || die "配置中缺少 NODE_ORDER：请填写 REALITY_V4、REALITY_V6、CDN_1 等节点标识"
-  [[ -n "$OUTBOUND_IP_VERSION" ]] || die "配置中缺少 OUTBOUND_IP_VERSION：只能填写 4 或 6"
-  parse_node_order
-  [[ -n "${PREFERRED_DOMAINS[0]:-}" ]] || die "没有找到 PREFERRED_DOMAIN_1、PREFERRED_DOMAIN_2 等 CDN 域名"
-  [[ -n "$XHTTP_PORT" ]] || die "配置中缺少 XHTTP_PORT：优选端口"
-  [[ -n "$SUB_PORT" ]] || die "配置中缺少 SUB_PORT：订阅端口"
-  [[ -n "$CERT_CONTENT" ]] || die "配置中缺少 CERTIFICATE_BEGIN/END 证书区块"
-  [[ -n "$KEY_CONTENT" ]] || die "配置中缺少 PRIVATE_KEY_BEGIN/END 私钥区块"
-}
-
-trim_value() {
-  local value="$1"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  printf '%s' "$value"
-}
-
-parse_node_order() {
-  local item
-  local -a raw_order=()
-
-  [[ "$NODE_ORDER" != ,* && "$NODE_ORDER" != *, && "$NODE_ORDER" != *,,* ]] || \
-    die "NODE_ORDER 不能包含空的节点标识：$NODE_ORDER"
-
-  NODE_ORDER_IDS=()
-  NODE_ORDER_SEEN=()
-  IFS=',' read -r -a raw_order <<< "$NODE_ORDER"
-  for item in "${raw_order[@]}"; do
-    item="$(trim_value "$item")"
-    [[ "$item" =~ ^(REALITY_V4|REALITY_V6|CDN_[1-9][0-9]*)$ ]] || \
-      die "NODE_ORDER 中的节点标识无效：$item；可用格式为 REALITY_V4、REALITY_V6、CDN_N"
-    [[ -z "${NODE_ORDER_SEEN[$item]+x}" ]] || die "NODE_ORDER 中的节点重复：$item"
-    NODE_ORDER_IDS+=("$item")
-    NODE_ORDER_SEEN["$item"]=1
-  done
-}
-
-# ORIGIN_DOMAIN、SUB_DOMAIN 可填写纯域名、Markdown 链接或 http(s) URL；PREFERRED_DOMAIN_N 只接受纯域名。
-normalize_domain_value() {
-  local value markdown_pattern
-  value="$(trim_value "$1")"
-  markdown_pattern='^\[[^]]+\]\((https?://)?([^/?#]+)(/[^)]*)?\)$'
-  if [[ "$value" =~ $markdown_pattern ]]; then
-    value="${BASH_REMATCH[2]}"
-  elif [[ "$value" =~ ^https?:// ]]; then
-    value="${value#http://}"
-    value="${value#https://}"
-    value="${value%%/*}"
-  fi
-  trim_value "$value"
-}
-
-config_value() {
-  local key="$1"
-  printf '%s\n' "$CONFIG_INPUT" | awk -v key="$key" '
-    {
-      line = $0
-      sub(/^[[:space:]]+/, "", line)
-    }
-    line !~ /^#/ && index(line, key "=") == 1 {
-      print substr(line, length(key) + 2)
-      exit
-    }
-  '
-}
+die() { printf '[失败] %s\n' "$*" >&2; exit 1; }
+info() { printf '[信息] %s\n' "$*"; }
+ok() { printf '[成功] %s\n' "$*"; }
+warn() { printf '[警告] %s\n' "$*" >&2; }
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+trim_value() { local v="$1"; v="${v#${v%%[![:space:]]*}}"; v="${v%${v##*[![:space:]]}}"; printf '%s' "$v"; }
+config_value() { printf '%s' "${CONFIG_VALUES[$1]:-}"; }
+required_value() { local v="${CONFIG_VALUES[$1]:-}"; [[ -n "$v" ]] || die "配置中缺少 $1"; printf '%s' "$v"; }
+urlencode() { jq -nr --arg value "$1" '$value | @uri'; }
+url_host() { [[ "$1" == *:* ]] && printf '[%s]' "$1" || printf '%s' "$1"; }
 
 extract_pem_block() {
-  local begin="$1"
-  local end="$2"
-  printf '%s\n' "$CONFIG_INPUT" | awk -v begin="$begin" -v end="$end" '
-    $0 == begin { capture = 1; next }
-    capture {
-      print
-      if ($0 == end) exit
-    }
-  '
+  local begin="$1" end="$2"
+  printf '%s\n' "$CONFIG_INPUT" | awk -v begin="$begin" -v end="$end" '$0==begin{capture=1;print;next} capture{print; if($0==end){found=1;exit}} END{if(!found)exit 1}'
 }
 
-validate_port() {
-  local label="$1"
-  local value="$2"
-  [[ "$value" =~ ^[0-9]+$ ]] || die "$label 必须是数字"
-  (( value >= 1 && value <= 65535 )) || die "$label 必须在 1-65535 范围内"
+read_deployment_config() {
+  local line key value pem="" field node_index=0 has_cert=0 has_key=0
+  printf '请粘贴从 YIjian_CONFIG_BEGIN 到 YIjian_CONFIG_END 的完整配置；每次 NODE_TYPE 开始一个新节点：\n' >&2
+  CONFIG_INPUT="$(awk '{sub(/\r$/,""); if($0=="YIjian_CONFIG_BEGIN"){started=1;next} if($0=="YIjian_CONFIG_END"){if(started)found=1;exit} if(started&&$0!="```")print} END{if(!started||!found)exit 1}')" || die "配置必须包含 YIjian_CONFIG_BEGIN 和 YIjian_CONFIG_END"
+  [[ -n "$CONFIG_INPUT" ]] || die "部署配置不能为空"
+  while IFS= read -r line; do
+    line="$(trim_value "$line")"; [[ -n "$line" ]] || continue
+    if [[ -n "$pem" ]]; then [[ "$line" == "${pem}_END" ]] && pem=""; continue; fi
+    case "$line" in CERTIFICATE_BEGIN) pem=CERTIFICATE; continue;; PRIVATE_KEY_BEGIN) pem=PRIVATE_KEY; continue;; \#*) continue;; esac
+    [[ "$line" =~ ^([A-Z0-9_]+)=(.*)$ ]] || die "无法识别的配置行：$line"
+    key="${BASH_REMATCH[1]}"; value="$(trim_value "${BASH_REMATCH[2]}")"
+    if [[ "$key" =~ ^NODE_(TYPE|PORT|PORT_RANGE|ENTRY_IP|EXIT_IP|NAME|PREFERRED_DOMAIN|ORIGIN_DOMAIN|SNI|PASSWORD)$ ]]; then
+      field="${BASH_REMATCH[1]}"
+      if [[ "$field" == TYPE ]]; then node_index=$((node_index + 1)); elif (( node_index == 0 )); then die "NODE_TYPE 必须放在每个节点配置的第一行"; fi
+      key="NODE_${node_index}_${field}"
+    elif [[ "$key" != SUBSCRIPTION_MODE && "$key" != SUB_DOMAIN && "$key" != SUB_IP && "$key" != SUB_PORT && "$key" != SUB_TOKEN ]]; then
+      die "未知配置项：$key"
+    fi
+    [[ -z "${CONFIG_VALUES[$key]+x}" ]] || die "配置项重复：$key"
+    CONFIG_VALUES["$key"]="$value"
+  done <<< "$CONFIG_INPUT"
+  [[ -z "$pem" ]] || die "证书或私钥区块缺少结束标记"
+  [[ "$CONFIG_INPUT" == *CERTIFICATE_BEGIN* ]] && has_cert=1
+  [[ "$CONFIG_INPUT" == *PRIVATE_KEY_BEGIN* ]] && has_key=1
+  (( has_cert == has_key )) || die "证书和私钥必须同时提供"
+  if (( has_cert == 1 )); then CERT_CONTENT="$(extract_pem_block CERTIFICATE_BEGIN CERTIFICATE_END)" || die "证书区块不完整"; KEY_CONTENT="$(extract_pem_block PRIVATE_KEY_BEGIN PRIVATE_KEY_END)" || die "私钥区块不完整"; fi
 }
 
-validate_outbound_ip_version() {
-  [[ "$1" == "4" || "$1" == "6" ]] || die "OUTBOUND_IP_VERSION 必须是 4 或 6，当前值：$1"
-}
-
+validate_port() { local label="$1" value="$2"; [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] || die "$label 必须是 1 到 65535 的十进制整数"; (( value <= 65535 )) || die "$label 超出范围"; }
 validate_domain() {
-  local label="$1"
-  local value="$2"
-  [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "$label 格式不正确：$value"
-  [[ "$value" != *..* ]] || die "$label 不能包含连续点号：$value"
+  local label="$1" value="$2" part; local -a parts=()
+  (( ${#value} <= 253 )) || die "$label 过长：$value"; [[ "$value" == *.* ]] || die "$label 必须是完整域名：$value"
+  IFS='.' read -r -a parts <<< "$value"
+  for part in "${parts[@]}"; do (( ${#part} <= 63 )) || die "$label 标签过长：$value"; [[ "$part" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || die "$label 格式不正确：$value"; done
+  [[ "$value" != *..* && "$value" != *. ]] || die "$label 格式不正确：$value"
 }
+validate_ipv4() { local v="$1" o; local -a a=(); [[ "$v" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1; IFS=. read -r -a a <<< "$v"; for o in "${a[@]}"; do [[ "$o" == 0 || "$o" != 0* ]] || return 1; (( 10#$o <= 255 )) || return 1; done; }
+validate_ipv6() { local v="$1" rest group count=0; [[ "$v" == *:* && "$v" =~ ^[0-9A-Fa-f:]+$ && "$v" != *:::* ]] || return 1; [[ "$v" != :* || "$v" == ::* ]] || return 1; [[ "$v" != *: || "$v" == *:: ]] || return 1; [[ "$v" != *::* || "${v#*::}" != *::* ]] || return 1; rest="$v"; while [[ -n "$rest" ]]; do if [[ "$rest" == *:* ]]; then group="${rest%%:*}"; rest="${rest#*:}"; else group="$rest"; rest=""; fi; if [[ -n "$group" ]]; then [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1; count=$((count+1)); fi; done; if [[ "$v" == *::* ]]; then (( count < 8 )); else (( count == 8 )); fi; }
+ip_family() { validate_ipv4 "$1" && { printf 4; return; }; validate_ipv6 "$1" && { printf 6; return; }; return 1; }
 
-validate_domain_list() {
-  local domain
-  for domain in "${PREFERRED_DOMAINS[@]}"; do
-    [[ -n "$domain" ]] || continue
-    validate_domain "优选域名" "$domain"
+validate_deployment_config() {
+  local index prefix type port entry exit range start end password sni key field subscription_mode expected=1 other
+  local -a raw_indices=(); declare -A used_ports=()
+  for key in "${!CONFIG_VALUES[@]}"; do [[ "$key" =~ ^NODE_([1-9][0-9]*)_ ]] && raw_indices+=("${BASH_REMATCH[1]}"); done
+  (( ${#raw_indices[@]} > 0 )) || die "配置中没有节点"
+  mapfile -t NODE_IDS < <(printf '%s\n' "${raw_indices[@]}" | sort -nu)
+  for index in "${NODE_IDS[@]}"; do [[ "$index" == "$expected" ]] || die "节点编号必须从 1 连续递增，缺少 NODE_${expected}"; expected=$((expected+1)); done
+  for index in "${NODE_IDS[@]}"; do
+    prefix="NODE_${index}"; type="$(required_value "${prefix}_TYPE")"; NODE_TYPES[$index]="$type"; NODE_NAMES[$index]="$(required_value "${prefix}_NAME")"
+    for key in "${!CONFIG_VALUES[@]}"; do [[ "$key" == "${prefix}_"* ]] || continue; field="${key#${prefix}_}"; case "$type" in REALITY) [[ "$field" =~ ^(TYPE|PORT|ENTRY_IP|EXIT_IP|NAME)$ ]] || die "节点 $index 的 REALITY 不使用 $field";; CDN) [[ "$field" =~ ^(TYPE|PORT|PREFERRED_DOMAIN|ORIGIN_DOMAIN|NAME)$ ]] || die "节点 $index 的 CDN 不使用 $field";; HY2) [[ "$field" =~ ^(TYPE|PORT_RANGE|ENTRY_IP|EXIT_IP|SNI|PASSWORD|NAME)$ ]] || die "节点 $index 的 HY2 不使用 $field";; *) die "节点 $index 的 TYPE 只能是 REALITY、CDN 或 HY2";; esac; done
+    case "$type" in
+      REALITY) port="$(required_value "${prefix}_PORT")"; validate_port "节点 $index 的 Reality 端口" "$port"; entry="$(required_value "${prefix}_ENTRY_IP")"; exit="$(required_value "${prefix}_EXIT_IP")"; ;;
+      CDN) port="$(required_value "${prefix}_PORT")"; validate_port "节点 $index 的 CDN 端口" "$port"; validate_domain "节点 $index 的优选域名" "$(required_value "${prefix}_PREFERRED_DOMAIN")"; validate_domain "节点 $index 的源站域名" "$(required_value "${prefix}_ORIGIN_DOMAIN")"; case "$port" in 443|2053|2083|2087|2096|8443);; *) die "节点 $index 的 CDN 端口不是 Cloudflare 支持的端口";; esac; CERT_REQUIRED=1; ;;
+      HY2) range="$(required_value "${prefix}_PORT_RANGE")"; [[ "$range" =~ ^([1-9][0-9]{0,4}):([1-9][0-9]{0,4})$ ]] || die "节点 $index 的 PORT_RANGE 必须是 起始端口:结束端口"; start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"; validate_port "节点 $index 的 HY2 起始端口" "$start"; validate_port "节点 $index 的 HY2 结束端口" "$end"; (( end > start )) || die "节点 $index 的 HY2 结束端口必须大于起始端口"; port="$start"; NODE_HY2_STARTS[$index]="$start"; NODE_HY2_ENDS[$index]="$end"; HY2_IDS+=("$index"); entry="$(required_value "${prefix}_ENTRY_IP")"; exit="$(required_value "${prefix}_EXIT_IP")"; sni="$(required_value "${prefix}_SNI")"; validate_domain "节点 $index 的 HY2 SNI" "$sni"; password="$(required_value "${prefix}_PASSWORD")"; [[ "$password" == AUTO || "$password" =~ ^[A-Za-z0-9._~-]{8,128}$ ]] || die "节点 $index 的 HY2 密码格式不正确"; NODE_HY2_PASSWORDS[$index]="$password"; CERT_REQUIRED=1; ;;
+      *) die "节点 $index 的 TYPE 只能是 REALITY、CDN 或 HY2";;
+    esac
+    NODE_PORTS[$index]="$port"
+    if [[ "$type" == REALITY || "$type" == HY2 ]]; then NODE_ENTRY_IPS[$index]="$entry"; NODE_EXIT_IPS[$index]="$exit"; NODE_IP_FAMILIES[$index]="$(ip_family "$entry")" || die "节点 $index 的入口 IP 无效"; NODE_EXIT_FAMILIES[$index]="$(ip_family "$exit")" || die "节点 $index 的出口 IP 无效"; [[ "$entry" != 0.0.0.0 && "$entry" != :: && "$exit" != 0.0.0.0 && "$exit" != :: ]] || die "节点 $index 的 IP 不能是未指定地址"; fi
+    [[ -z "${used_ports[$port]+x}" ]] || die "节点 $index 的端口 $port 与节点 ${used_ports[$port]} 重复"; used_ports[$port]="$index"
   done
-}
-
-validate_host_port() {
-  local label="$1"
-  local value="$2"
-  [[ "$value" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] || die "$label 必须是 host:port 格式：$value"
-  local port="${value##*:}"
-  validate_port "$label 中的端口" "$port"
-}
-
-detect_public_host() {
-  local url="https://icanhazip.com"
-  local public_ipv4=""
-  local public_ipv6=""
-  if command_exists curl; then
-    public_ipv4="$(curl -s4m5 -k "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-    public_ipv6="$(curl -s6m5 -k "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-  elif command_exists wget; then
-    public_ipv4="$(timeout 5 wget -4 --tries=2 -qO- "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-    public_ipv6="$(timeout 5 wget -6 --tries=2 -qO- "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-  fi
-  if [[ "$public_ipv4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    printf '%s' "$public_ipv4"
-  elif [[ "$public_ipv6" == *:* ]]; then
-    printf '[%s]' "$public_ipv6"
-  else
-    return 1
-  fi
-}
-
-find_subscription_file() {
-  local output_dir="$1"
-  find "$output_dir/xray-sub" -type f -name 'jhsub.txt' -print 2>/dev/null | sed -n '1p'
-}
-
-rebuild_subscription_url() {
-  local output_dir="$1"
-  local sub_file=""
-  local sub_token=""
-  local sub_domain=""
-
-  sub_file="$(find_subscription_file "$output_dir")"
-  [[ -n "$sub_file" ]] || return 1
-  sub_token="$(basename "$(dirname "$sub_file")")"
-  [[ -n "$sub_token" ]] || return 1
-
-  if [[ -s "$output_dir/yijian-subscription-domain.txt" ]]; then
-    sub_domain="$(sed -n '1p' "$output_dir/yijian-subscription-domain.txt" | tr -d '\r')"
-  fi
-  [[ -n "$sub_domain" ]] || return 1
-  printf 'https://%s/%s/jhsub.txt' "$sub_domain" "$sub_token"
-}
-
-show_port_usage() {
-  if command_exists ss; then
-    ss -lntup
-  elif command_exists netstat; then
-    netstat -lntup
-  elif command_exists busybox && busybox netstat --help >/dev/null 2>&1; then
-    busybox netstat -lntup
-  elif command_exists busybox-extras && busybox-extras netstat --help >/dev/null 2>&1; then
-    busybox-extras netstat -lntup
-  else
-    warn "未找到 ss 或 netstat，无法列出当前监听端口"
-    return 1
-  fi
-}
-
-show_deployment() {
-  local output_dir="${1:-/etc/xray}"
-  local link_file="$output_dir/vless-links.txt"
-  local sub_url_file="$output_dir/yijian-subscription-url.txt"
-  local sub_url=""
-  local node_number=0
-  local node_line=""
-
-  [[ -d "$output_dir" ]] || die "输出目录不存在：$output_dir"
-  [[ -s "$link_file" ]] || die "节点文件不存在或为空：$link_file"
-
-  if [[ -s "$sub_url_file" ]]; then
-    sub_url="$(sed -n '1p' "$sub_url_file")"
-  else
-    sub_url="$(rebuild_subscription_url "$output_dir" || true)"
-  fi
-  [[ -n "$sub_url" ]] || die "无法确定订阅网址；请检查订阅服务是否运行，或使用部署时保存的订阅网址"
-
-  while IFS= read -r node_line; do
-    [[ -n "$node_line" ]] || continue
-    node_number=$((node_number + 1))
-    if [[ "$node_line" == *"security=reality"* ]]; then
-      echo "节点 $node_number：VLESS-TCP-Reality-Vision"
-    else
-      echo "节点 $node_number：VLESS-XHTTP-TLS-CDN"
-    fi
-    printf '%s\n' "$node_line"
-  done < "$link_file"
-  [[ "$node_number" -gt 0 ]] || die "节点文件中未找到有效节点：$link_file"
-  echo "订阅内容：$node_number 个节点"
-  echo "订阅网址：$sub_url"
-  echo
-  echo "所有端口占用："
-  show_port_usage || true
-}
-
-# 使用 jq 的 URI 编码，避免路径或域名中的特殊字符破坏 VLESS 链接。
-urlencode() {
-  jq -nr --arg value "$1" '$value | @uri'
-}
-
-find_xray() {
-  local candidate
-  if command_exists xray; then
-    command -v xray
-    return 0
-  fi
-  for candidate in /usr/local/bin/xray /usr/bin/xray /usr/local/sbin/xray; do
-    if [[ -x "$candidate" ]]; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
-# 直接下载 Xray 官方 Release，不要求系统使用 systemd。
-install_xray() {
-  local asset archive extract_dir target
-  case "$(uname -m)" in
-    x86_64|amd64) asset="Xray-linux-64.zip" ;;
-    aarch64|arm64) asset="Xray-linux-arm64-v8a.zip" ;;
-    *) die "当前 Xray 安装暂不支持此 CPU 架构：$(uname -m)" ;;
+  subscription_mode="$(config_value SUBSCRIPTION_MODE)"; if [[ -z "$subscription_mode" ]]; then [[ -n "${CONFIG_VALUES[SUB_DOMAIN]+x}" ]] && subscription_mode=DOMAIN || subscription_mode=NONE; fi; SUB_DOMAIN=""; SUB_IP=""; SUB_PORT=""; SUB_TOKEN=""
+  case "$subscription_mode" in
+    NONE) for key in SUB_DOMAIN SUB_IP SUB_PORT SUB_TOKEN; do [[ -z "${CONFIG_VALUES[$key]+x}" ]] || die "SUBSCRIPTION_MODE=NONE 时不能配置 $key"; done;;
+    DOMAIN) [[ -z "${CONFIG_VALUES[SUB_IP]+x}" ]] || die "DOMAIN 模式不使用 SUB_IP"; SUB_DOMAIN="$(required_value SUB_DOMAIN)"; SUB_PORT="$(required_value SUB_PORT)"; SUB_TOKEN="$(required_value SUB_TOKEN)"; validate_domain "订阅域名" "$SUB_DOMAIN"; validate_port "HTTPS 订阅端口" "$SUB_PORT"; SUB_HOST="$SUB_DOMAIN"; SUBSCRIPTION_ENABLED=1; CERT_REQUIRED=1;;
+    IP) [[ -z "${CONFIG_VALUES[SUB_DOMAIN]+x}" ]] || die "IP 模式不使用 SUB_DOMAIN"; SUB_IP="$(required_value SUB_IP)"; SUB_PORT="$(required_value SUB_PORT)"; SUB_TOKEN="$(required_value SUB_TOKEN)"; SUB_HOST_FAMILY="$(ip_family "$SUB_IP")" || die "订阅 IP 无效"; validate_port "HTTPS 订阅端口" "$SUB_PORT"; SUB_HOST="$SUB_IP"; SUBSCRIPTION_ENABLED=1; CERT_REQUIRED=1;;
+    *) die "SUBSCRIPTION_MODE 只能是 NONE、DOMAIN 或 IP";;
   esac
-
-  archive="$(mktemp /tmp/xray.XXXXXX.zip)" || die "无法创建 Xray 下载临时文件"
-  extract_dir="$(mktemp -d /tmp/xray-core.XXXXXX)" || die "无法创建 Xray 解压目录"
-  target="/usr/local/bin/xray"
-  if command_exists curl; then
-    curl -fL "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" -o "$archive" || die "下载 Xray 官方二进制失败"
-  else
-    wget -O "$archive" "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" || die "下载 Xray 官方二进制失败"
-  fi
-  unzip -j "$archive" xray -d "$extract_dir" >/dev/null || die "解压 Xray 官方二进制失败"
-  install -m 755 "$extract_dir/xray" "$target" || die "安装 Xray 二进制失败"
-  rm -f -- "$archive" "$extract_dir/xray"
-  rmdir -- "$extract_dir" 2>/dev/null || true
-  "$target" version >/dev/null 2>&1 || die "安装后的 Xray 无法运行"
+  SUBSCRIPTION_MODE="$subscription_mode"; (( CERT_REQUIRED == 0 )) || [[ -n "$CERT_CONTENT" && -n "$KEY_CONTENT" ]] || die "当前配置需要同时提供证书和私钥"
+  if (( SUBSCRIPTION_ENABLED == 1 )); then [[ -z "${used_ports[$SUB_PORT]+x}" ]] || die "订阅端口与节点端口重复"; [[ "$SUB_TOKEN" == AUTO || "$SUB_TOKEN" =~ ^[A-Za-z0-9_-]{12,64}$ ]] || die "SUB_TOKEN 格式不正确"; fi
+  for index in "${HY2_IDS[@]}"; do
+    start="${NODE_HY2_STARTS[$index]}"; end="${NODE_HY2_ENDS[$index]}"
+    (( SUBSCRIPTION_ENABLED == 0 || SUB_PORT < start || SUB_PORT > end )) || die "订阅端口落在节点 $index 的 HY2 跳跃范围内"
+    for other in "${NODE_IDS[@]}"; do [[ "$other" == "$index" ]] && continue; port="${NODE_PORTS[$other]}"; (( port < start || port > end )) || die "节点 $other 的端口落在节点 $index 的 HY2 跳跃范围内"; done
+    for other in "${HY2_IDS[@]}"; do [[ "$other" -gt "$index" ]] || continue; (( ${NODE_HY2_STARTS[$other]} > end || ${NODE_HY2_ENDS[$other]} < start )) || die "节点 $index 与节点 $other 的 HY2 跳跃范围重叠"; done
+  done
 }
 
-# 按 Argosbx 的兼容顺序启动：systemd、OpenRC、无服务管理器。
-start_xray() {
-  if command_exists systemctl && [[ -d /run/systemd/system ]]; then
+detect_platform() {
+  if command_exists systemctl && [[ -d /run/systemd/system ]]; then SERVICE_MODE=systemd; elif command_exists rc-service && command_exists rc-update; then SERVICE_MODE=openrc; else die "未找到可用的 systemd 或 OpenRC 服务管理器"; fi
+  if command_exists apk; then PACKAGE_MANAGER=apk; elif command_exists apt-get; then PACKAGE_MANAGER=apt; else die "未找到支持的 apk 或 apt-get 软件包管理器"; fi
+}
+find_nginx_runner() { if command_exists nginx && nginx -v >/dev/null 2>&1; then NGINX_BIN="$(command -v nginx)"; return; fi; NGINX_BIN=""; return 1; }
+find_xray() { local c; command_exists xray && { command -v xray; return; }; for c in /usr/local/bin/xray /usr/bin/xray /usr/local/sbin/xray; do [[ -x "$c" ]] && { printf '%s' "$c"; return; }; done; return 1; }
+install_dependencies() {
+  local -a packages=(jq openssl unzip coreutils curl ca-certificates); (( SUBSCRIPTION_ENABLED == 1 )) && packages+=(nginx); (( ${#HY2_IDS[@]} > 0 )) && packages+=(nftables)
+  local -a missing=(); local p; for p in "${packages[@]}"; do case "$p" in jq) command_exists jq || missing+=("$p");; openssl) command_exists openssl || missing+=("$p");; unzip) command_exists unzip || missing+=("$p");; coreutils) command_exists sha256sum || missing+=("$p");; curl) command_exists curl || missing+=("$p");; ca-certificates) [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing+=("$p");; nginx) command_exists nginx || missing+=("$p");; nftables) command_exists nft || missing+=("$p");; esac; done
+  if (( ${#missing[@]} > 0 )); then
+    info "安装缺少的工具：${missing[*]}"
+    if [[ "$PACKAGE_MANAGER" == apk ]]; then apk add --no-cache "${missing[@]}" || die "Alpine 依赖安装失败"; else apt-get update || die "APT 软件源更新失败"; DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" || die "APT 依赖安装失败"; fi
+  fi
+  command_exists jq && command_exists openssl && command_exists sha256sum && { command_exists curl || command_exists wget; } || die "依赖安装后仍缺少必需工具"; (( SUBSCRIPTION_ENABLED == 0 )) || find_nginx_runner || die "订阅模式需要 Nginx"; (( ${#HY2_IDS[@]} == 0 )) || command_exists nft || die "HY2 需要 nftables";
+  if (( SUBSCRIPTION_ENABLED == 1 )); then
+    if id nginx >/dev/null 2>&1; then NGINX_USER=nginx; NGINX_GROUP=nginx; elif id www-data >/dev/null 2>&1; then NGINX_USER=www-data; NGINX_GROUP=www-data; else die "找不到 Nginx 运行用户"; fi
+    if [[ "$SERVICE_MODE" == systemd ]]; then systemctl disable --now nginx.service >/dev/null 2>&1 || true; else rc-service nginx stop >/dev/null 2>&1 || true; rc-update del nginx default >/dev/null 2>&1 || true; fi
+  fi
+}
+
+install_xray() { local asset archive extract_dir; case "$(uname -m)" in x86_64|amd64) asset=Xray-linux-64.zip;; aarch64|arm64) asset=Xray-linux-arm64-v8a.zip;; *) die "当前架构不受 Xray 支持";; esac; archive="$(mktemp /tmp/xray.XXXXXX.zip)"; extract_dir="$(mktemp -d /tmp/xray-core.XXXXXX)"; if command_exists curl; then curl -fL "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" -o "$archive" || die "下载 Xray 失败"; else wget -O "$archive" "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" || die "下载 Xray 失败"; fi; unzip -j "$archive" xray -d "$extract_dir" >/dev/null || die "解压 Xray 失败"; install -m 755 "$extract_dir/xray" /usr/local/bin/xray || die "安装 Xray 失败"; rm -f "$archive" "$extract_dir/xray"; rmdir "$extract_dir" 2>/dev/null || true; XRAY_BIN=/usr/local/bin/xray; "$XRAY_BIN" version >/dev/null 2>&1 || die "安装后的 Xray 无法运行"; }
+
+prepare_certificate() {
+  local cert_pub key_pub domain index; printf '%s\n' "$CERT_CONTENT" > "$TMP_DIR/cert.pem"; printf '%s\n' "$KEY_CONTENT" > "$TMP_DIR/key.pem"; openssl x509 -in "$TMP_DIR/cert.pem" -noout >/dev/null 2>&1 || die "证书不是有效 PEM X.509"; openssl pkey -in "$TMP_DIR/key.pem" -passin pass: -noout >/dev/null 2>&1 || die "私钥无效或带密码"; if [[ "$SUBSCRIPTION_MODE" == DOMAIN ]]; then openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkhost "$SUB_DOMAIN" >/dev/null 2>&1 || die "证书不包含订阅域名"; elif [[ "$SUBSCRIPTION_MODE" == IP ]]; then openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkip "$SUB_IP" >/dev/null 2>&1 || die "证书不包含订阅 IP"; fi; for index in "${NODE_IDS[@]}"; do case "${NODE_TYPES[$index]}" in CDN) domain="$(config_value "NODE_${index}_ORIGIN_DOMAIN")";; HY2) domain="$(config_value "NODE_${index}_SNI")";; *) continue;; esac; openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkhost "$domain" >/dev/null 2>&1 || die "证书不包含节点 $index 的域名"; done; cert_pub="$(openssl x509 -in "$TMP_DIR/cert.pem" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; key_pub="$(openssl pkey -in "$TMP_DIR/key.pem" -passin pass: -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || die "证书和私钥不匹配"; CERT_SHA256="$(openssl x509 -in "$TMP_DIR/cert.pem" -outform DER | sha256sum | awk '{print $1}')"; CERT_FILE="$OUTPUT_DIR/yijian-origin-cert.pem"; KEY_FILE="$OUTPUT_DIR/yijian-origin-key.pem"; install -m 600 "$TMP_DIR/cert.pem" "$CERT_FILE"; install -m 600 "$TMP_DIR/key.pem" "$KEY_FILE";
+}
+
+extract_x25519_value() { local kind="$1"; printf '%s\n' "$KEY_OUTPUT" | awk -v kind="$kind" 'function emit(v){gsub(/\r/,"",v);gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);if(v!=""){print v;exit}}{for(i=1;i<=NF;i++){t=$i;if(kind=="private"){if(t=="PrivateKey:"&&i<NF)emit($(i+1));if(t~/^PrivateKey:[^[:space:]]+$/){sub(/^PrivateKey:/,"",t);emit(t)};if(t=="Private"&&i<NF){n=$(i+1);if(n=="key:"&&i+1<NF)emit($(i+2));if(n~/^key:[^[:space:]]+$/){sub(/^key:/,"",n);emit(n)}}}else{if(t=="Password"&&i<NF){n=$(i+1);if(n=="(PublicKey):"&&i+1<NF)emit($(i+2));if(n~/^\(PublicKey\):[^[:space:]]+$/){sub(/^\(PublicKey\):/,"",n);emit(n)}};if(t=="Password:"&&i<NF)emit($(i+1));if(t~/^Password:[^[:space:]]+$/){sub(/^Password:/,"",t);emit(t)};if(t=="PublicKey:"&&i<NF)emit($(i+1));if(t~/^PublicKey:[^[:space:]]+$/){sub(/^PublicKey:/,"",t);emit(t)};if(t=="Public"&&i<NF){n=$(i+1);if(n=="key:"&&i+1<NF)emit($(i+2));if(n~/^key:[^[:space:]]+$/){sub(/^key:/,"",n);emit(n)}}}}}' ; }
+
+prepare_base_config() { TMP_CONFIG="$TMP_DIR/config.json"; if [[ -e "$CONFIG_PATH" ]]; then [[ -f "$CONFIG_PATH" ]] || die "Xray 配置路径不是普通文件"; jq empty "$CONFIG_PATH" >/dev/null 2>&1 || die "现有 Xray 配置不是有效 JSON"; BASE_CONFIG="$CONFIG_PATH"; else BASE_CONFIG="$TMP_DIR/base.json"; cat > "$BASE_CONFIG" <<'EOF'
+{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"block"}]}
+EOF
+  fi; }
+
+build_nodes() {
+  local index prefix type port tag outtag entry exit family name uuid short_id private_key public_key reality_json outbound_json rule_json link listen origin preferred path_enc origin_enc password sni
+  REALITY_SNI_ENC="$(urlencode "$REALITY_SNI")"; XHTTP_PATH="/xhttp-$(openssl rand -hex 6)"; path_enc="$(urlencode "$XHTTP_PATH")"; NEW_INBOUNDS=(); NEW_OUTBOUNDS=(); NEW_RULES=(); NODE_LINES=()
+  for index in "${NODE_IDS[@]}"; do prefix="NODE_${index}"; type="${NODE_TYPES[$index]}"; port="${NODE_PORTS[$index]}"; name="${NODE_NAMES[$index]}"; tag="yijian-in-$index"; outtag="yijian-out-$index"; listen="0.0.0.0"; [[ "$type" == CDN || "${NODE_IP_FAMILIES[$index]:-4}" == 6 ]] && listen="::";
+    case "$type" in
+      REALITY) entry="${NODE_ENTRY_IPS[$index]}"; exit="${NODE_EXIT_IPS[$index]}"; family="${NODE_EXIT_FAMILIES[$index]}"; uuid="$(cat /proc/sys/kernel/random/uuid)"; short_id="$(openssl rand -hex 8)"; KEY_OUTPUT="$($XRAY_BIN x25519 2>&1)" || die "节点 $index 的 Reality 密钥生成失败"; private_key="$(extract_x25519_value private)"; public_key="$(extract_x25519_value public)"; [[ -n "$private_key" && -n "$public_key" ]] || die "节点 $index 的 Reality 密钥无法识别"; reality_json="$(jq -cn --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg uuid "$uuid" --arg dest "$REALITY_DEST" --arg sni "$REALITY_SNI" --arg pk "$private_key" --arg sid "$short_id" '{tag:$tag,listen:$listen,port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:"none"},streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:$dest,xver:0,serverNames:[$sni],privateKey:$pk,shortIds:[$sid]}}}')"; outbound_json="$(jq -cn --arg tag "$outtag" --arg exit "$exit" --arg strategy "UseIPv$family" '{tag:$tag,protocol:"freedom",sendThrough:$exit,settings:{domainStrategy:$strategy}}')"; link="vless://$uuid@$(url_host "$entry"):$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_SNI_ENC&fp=chrome&pbk=$(urlencode "$public_key")&sid=$short_id&type=tcp&headerType=none#$(urlencode "$name")";;
+      CDN) preferred="$(config_value "${prefix}_PREFERRED_DOMAIN")"; origin="$(config_value "${prefix}_ORIGIN_DOMAIN")"; uuid="$(cat /proc/sys/kernel/random/uuid)"; reality_json="$(jq -cn --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg uuid "$uuid" --arg path "$XHTTP_PATH" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '{tag:$tag,listen:$listen,port:$port,protocol:"vless",settings:{clients:[{id:$uuid}],decryption:"none"},streamSettings:{network:"xhttp",security:"tls",xhttpSettings:{path:$path,mode:"auto"},tlsSettings:{alpn:["h2","http/1.1"],certificates:[{certificateFile:$cert,keyFile:$key}]}}}')"; outbound_json="$(jq -cn --arg tag "$outtag" '{tag:$tag,protocol:"freedom",settings:{domainStrategy:"AsIs"}}')"; origin_enc="$(urlencode "$origin")"; link="vless://$uuid@$preferred:$port?encryption=none&security=tls&sni=$origin_enc&host=$origin_enc&type=xhttp&path=$path_enc&mode=auto#$(urlencode "$name")";;
+      HY2) entry="${NODE_ENTRY_IPS[$index]}"; exit="${NODE_EXIT_IPS[$index]}"; family="${NODE_EXIT_FAMILIES[$index]}"; sni="$(config_value "${prefix}_SNI")"; password="${NODE_HY2_PASSWORDS[$index]}"; [[ "$password" == AUTO ]] && password="$(openssl rand -hex 16)" && NODE_HY2_PASSWORDS[$index]="$password"; reality_json="$(jq -cn --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg auth "$password" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '{tag:$tag,listen:$listen,port:$port,protocol:"hysteria",settings:{version:2,users:[{auth:$auth}]},streamSettings:{method:"hysteria",security:"tls",hysteriaSettings:{version:2},tlsSettings:{alpn:["h3"],certificates:[{certificateFile:$cert,keyFile:$key}]}}}')"; outbound_json="$(jq -cn --arg tag "$outtag" --arg exit "$exit" --arg strategy "UseIPv$family" '{tag:$tag,protocol:"freedom",sendThrough:$exit,settings:{domainStrategy:$strategy}}')"; link="hysteria2://$(urlencode "$password")@$(url_host "$entry"):$port?security=tls&alpn=h3&insecure=0&allowInsecure=0&mport=${NODE_HY2_STARTS[$index]}-${NODE_HY2_ENDS[$index]}&sni=$(urlencode "$sni")&pinSHA256=$CERT_SHA256#$(urlencode "$name")";;
+    esac
+    NEW_INBOUNDS+=("$reality_json"); NEW_OUTBOUNDS+=("$outbound_json"); rule_json="$(jq -cn --arg inbound "$tag" --arg outbound "$outtag" '{type:"field",inboundTag:[$inbound],outboundTag:$outbound}')"; NEW_RULES+=("$rule_json"); NODE_LINES+=("$link")
+  done
+}
+
+merge_xray_config() { local i o r; i="$(printf '%s\n' "${NEW_INBOUNDS[@]}" | jq -s '.')"; o="$(printf '%s\n' "${NEW_OUTBOUNDS[@]}" | jq -s '.')"; r="$(printf '%s\n' "${NEW_RULES[@]}" | jq -s '.')"; jq --argjson ni "$i" --argjson no "$o" --argjson nr "$r" 'def mi: test("^yijian-in-[1-9][0-9]*$") or .=="vless-reality-vision" or .=="vless-xhttp-tls"; def mo: test("^yijian-out-[1-9][0-9]*$"); .inbounds=((.inbounds//[])|map(select((.tag//"")|mi|not))+$ni)|.outbounds=((.outbounds//[])|map(select((.tag//"")|mo|not))+$no)|.routing=(.routing//{})|.routing.rules=($nr+((.routing.rules//[])|map(select((any(.inboundTag[]?;mi) or ((.outboundTag//"")|mo))|not))))' "$BASE_CONFIG" > "$TMP_CONFIG" || die "生成 Xray 配置失败"; jq empty "$TMP_CONFIG" >/dev/null 2>&1 || die "生成的 Xray 配置不是有效 JSON"; "$XRAY_BIN" run -test -c "$TMP_CONFIG" >/dev/null 2>&1 || die "Xray 配置检查失败"; }
+
+configure_hy2_hop_service() {
+  local index nft_file=/etc/xray/yijian-hy2-hop.nft nft_bin="$(command -v nft || true)"
+  if (( ${#HY2_IDS[@]} == 0 )); then
+    if [[ "$SERVICE_MODE" == systemd ]]; then systemctl disable --now xray-yijian-hy2-hop.service >/dev/null 2>&1 || true; else rc-service xray-yijian-hy2-hop stop >/dev/null 2>&1 || true; rc-update del xray-yijian-hy2-hop default >/dev/null 2>&1 || true; fi
+    rm -f -- /etc/systemd/system/xray-yijian-hy2-hop.service
+    [[ "$SERVICE_MODE" == systemd ]] && systemctl daemon-reload >/dev/null 2>&1 || true
+    rm -f -- "$nft_file" /etc/init.d/xray-yijian-hy2-hop
+    command_exists nft && nft delete table inet xray_yijian_hy2 >/dev/null 2>&1 || true
+    return
+  fi
+  [[ -n "$nft_bin" ]] || die "找不到 nftables"
+  cat > "$nft_file" <<'EOF'
+table inet xray_yijian_hy2 {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+EOF
+  for index in "${HY2_IDS[@]}"; do
+    if [[ "${NODE_IP_FAMILIES[$index]}" == 6 ]]; then
+      printf '    ip6 daddr %s udp dport %s-%s redirect to :%s\n' "${NODE_ENTRY_IPS[$index]}" "${NODE_HY2_STARTS[$index]}" "${NODE_HY2_ENDS[$index]}" "${NODE_HY2_STARTS[$index]}" >> "$nft_file"
+    else
+      printf '    ip daddr %s udp dport %s-%s redirect to :%s\n' "${NODE_ENTRY_IPS[$index]}" "${NODE_HY2_STARTS[$index]}" "${NODE_HY2_ENDS[$index]}" "${NODE_HY2_STARTS[$index]}" >> "$nft_file"
+    fi
+  done
+  cat >> "$nft_file" <<'EOF'
+  }
+}
+EOF
+  if [[ "$SERVICE_MODE" == systemd ]]; then
+    cat > /etc/systemd/system/xray-yijian-hy2-hop.service <<EOF
+[Unit]
+Description=Xray yijian HY2 UDP port hopping
+After=network-online.target
+Wants=network-online.target
+Before=xray-yijian.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-$nft_bin delete table inet xray_yijian_hy2
+ExecStart=$nft_bin -f $nft_file
+ExecStop=-$nft_bin delete table inet xray_yijian_hy2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload || die "systemd 配置加载失败"
+    systemctl enable xray-yijian-hy2-hop.service >/dev/null || die "无法启用 HY2 跳跃服务"
+    systemctl restart xray-yijian-hy2-hop.service || die "无法应用 HY2 跳跃规则"
+    systemctl is-active --quiet xray-yijian-hy2-hop.service || die "HY2 跳跃服务未运行"
+    return
+  fi
+  cat > /etc/init.d/xray-yijian-hy2-hop <<EOF
+#!/sbin/openrc-run
+description="Xray yijian HY2 UDP port hopping"
+command="$nft_bin"
+command_args="-f $nft_file"
+start_pre() { "$nft_bin" delete table inet xray_yijian_hy2 >/dev/null 2>&1 || true; }
+stop() { "$nft_bin" delete table inet xray_yijian_hy2 >/dev/null 2>&1 || true; }
+depend() { need net; }
+EOF
+  chmod 755 /etc/init.d/xray-yijian-hy2-hop
+  rc-update add xray-yijian-hy2-hop default >/dev/null 2>&1 || die "无法启用 HY2 跳跃自启动"
+  rc-service xray-yijian-hy2-hop restart >/dev/null 2>&1 || die "无法应用 HY2 跳跃规则"
+  rc-service xray-yijian-hy2-hop status >/dev/null 2>&1 || die "HY2 跳跃服务未运行"
+}
+
+start_xray_service() {
+  if [[ "$SERVICE_MODE" == systemd ]]; then
     cat > /etc/systemd/system/xray-yijian.service <<EOF
 [Unit]
-Description=Xray yijian service
-After=network.target
+Description=Xray yijian node service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -425,145 +275,77 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload || die "systemd 配置加载失败"
-    systemctl enable --now xray-yijian.service || die "systemd 无法启动 Xray"
-    XRAY_START_MODE="systemd：xray-yijian.service"
-  elif command_exists rc-service && command_exists rc-update; then
-    cat > /etc/init.d/xray-yijian <<EOF
+    systemctl enable xray-yijian.service >/dev/null || die "无法启用 Xray 自启动"
+    systemctl restart xray-yijian.service || die "Xray 启动失败"
+    systemctl is-active --quiet xray-yijian.service || die "Xray 服务未运行"
+    return
+  fi
+  cat > /etc/init.d/xray-yijian <<EOF
 #!/sbin/openrc-run
-description="Xray yijian service"
+description="Xray yijian node service"
 command="$XRAY_BIN"
 command_args="run -c $CONFIG_PATH"
 command_background="yes"
 pidfile="/run/xray-yijian.pid"
-depend() {
-  need net
-}
+depend() { need net; use xray-yijian-hy2-hop; }
 EOF
-    chmod 755 /etc/init.d/xray-yijian
-    rc-update add xray-yijian default >/dev/null 2>&1 || die "OpenRC 无法添加 Xray 自启动"
-    rc-service xray-yijian restart >/dev/null 2>&1 || rc-service xray-yijian start >/dev/null 2>&1 || die "OpenRC 无法启动 Xray"
-    XRAY_START_MODE="OpenRC：xray-yijian"
-  else
-    nohup "$XRAY_BIN" run -c "$CONFIG_PATH" >/dev/null 2>&1 &
-    XRAY_PID="$!"
-    printf '%s\n' "$XRAY_PID" > "$OUTPUT_DIR/xray-yijian.pid"
-    XRAY_START_MODE="后台进程：PID $XRAY_PID"
-  fi
+  chmod 755 /etc/init.d/xray-yijian
+  rc-update add xray-yijian default >/dev/null 2>&1 || die "无法启用 Xray 自启动"
+  rc-service xray-yijian restart >/dev/null 2>&1 || rc-service xray-yijian start >/dev/null 2>&1 || die "Xray 启动失败"
+  rc-service xray-yijian status >/dev/null 2>&1 || die "Xray 服务未运行"
 }
 
-# 查找 Nginx；订阅服务使用独立配置，不接管系统默认 Nginx 配置。
-find_nginx_runner() {
-  if command_exists nginx && nginx -v >/dev/null 2>&1; then
-    NGINX_BIN="$(command -v nginx)"
-    return 0
-  fi
-  NGINX_BIN=""
-  return 1
-}
-
-stop_existing_subscription_service() {
-  local old_pid=""
-  local old_cmd=""
-
-  if command_exists systemctl && [[ -d /run/systemd/system ]]; then
-    systemctl stop xray-yijian-sub.service >/dev/null 2>&1 || true
-  elif command_exists rc-service && [[ -x /etc/init.d/xray-yijian-sub ]]; then
-    rc-service xray-yijian-sub stop >/dev/null 2>&1 || true
-  fi
-
-  for pid_file in /run/xray-yijian-sub.pid /run/xray-yijian-sub-nginx.pid; do
-    if [[ -s "$pid_file" ]]; then
-      old_pid="$(sed -n '1p' "$pid_file" | tr -d '\r')"
-      if [[ "$old_pid" =~ ^[0-9]+$ && -r "/proc/$old_pid/cmdline" ]]; then
-        old_cmd="$(tr '\0' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null || true)"
-        if [[ "$old_cmd" == *httpd* || "$old_cmd" == *nginx* ]]; then
-          kill "$old_pid" >/dev/null 2>&1 || true
-        fi
-      fi
-    fi
-  done
+write_subscription_files() {
+  [[ "$SUB_TOKEN" == AUTO ]] && SUB_TOKEN="$(openssl rand -hex 16)"
+  SUB_DIR="$SUB_ROOT/$SUB_TOKEN"; SUB_FILE="$SUB_DIR/jhsub.txt"; mkdir -p -- "$SUB_DIR"
+  printf '%s\n' "${NODE_LINES[@]}" > "$OUTPUT_DIR/vless-links.txt"; printf '%s\n' "${NODE_LINES[@]}" > "$SUB_FILE"
+  chmod 600 "$OUTPUT_DIR/vless-links.txt"; chmod 640 "$SUB_FILE"; id "$NGINX_USER" >/dev/null 2>&1 || die "找不到 Nginx 运行用户"; chown "root:$NGINX_GROUP" "$SUB_ROOT" "$SUB_DIR" "$SUB_FILE" || die "无法设置订阅文件属主"; chmod 750 "$SUB_ROOT" "$SUB_DIR"
+  if [[ "$SUBSCRIPTION_MODE" == IP ]]; then SUB_URL_HOST="$(url_host "$SUB_IP")"; else SUB_URL_HOST="$SUB_DOMAIN"; fi
+  if [[ "$SUB_PORT" == 443 ]]; then SUB_URL="https://${SUB_URL_HOST}/${SUB_TOKEN}/jhsub.txt"; else SUB_URL="https://${SUB_URL_HOST}:${SUB_PORT}/${SUB_TOKEN}/jhsub.txt"; fi
+  printf '%s\n' "$SUB_URL" > "$OUTPUT_DIR/yijian-subscription-url.txt"; printf '%s\n' "$SUB_PORT" > "$OUTPUT_DIR/yijian-subscription-port.txt"; printf '%s\n' "$SUB_TOKEN" > "$OUTPUT_DIR/yijian-subscription-token.txt"; printf '%s\n' "$SUB_ROOT" > "$OUTPUT_DIR/yijian-subscription-root.txt"; chmod 600 "$OUTPUT_DIR"/yijian-subscription-*.txt
 }
 
 write_subscription_nginx_config() {
-  local nginx_test_output=""
-  [[ -n "$NGINX_BIN" ]] || die "未找到 Nginx，无法提供 HTTPS 订阅"
-  [[ -n "$SUB_NGINX_CONF" && -n "$SUB_NGINX_PID" ]] || die "HTTPS 订阅服务路径未初始化"
-  mkdir -p -- "$SUB_ROOT"
-  if id nginx >/dev/null 2>&1; then
-    chown root:nginx "$SUB_ROOT" 2>/dev/null || die "无法设置订阅目录属主"
-    chmod 750 "$SUB_ROOT"
-  else
-    die "Nginx 用户不存在，无法安全提供订阅文件"
-  fi
-
-  SUB_NGINX_ERROR_LOG="$OUTPUT_DIR/yijian-subscription-nginx-error.log"
+  local listen_address="0.0.0.0" ipv6_listen="" server_name="$SUB_DOMAIN"
+  [[ "$SUBSCRIPTION_MODE" == IP ]] && server_name=_
+  [[ -s /proc/net/if_inet6 ]] && ipv6_listen="        listen [::]:$SUB_PORT ssl;"
+  SUB_NGINX_CONF="$OUTPUT_DIR/yijian-subscription-nginx.conf"; SUB_NGINX_PID="/run/xray-yijian-sub-nginx.pid"
   cat > "$SUB_NGINX_CONF" <<EOF
-user nginx;
+user $NGINX_USER;
 daemon off;
 worker_processes 1;
 pid $SUB_NGINX_PID;
-error_log $SUB_NGINX_ERROR_LOG warn;
-
-events {
-    worker_connections 64;
-}
-
+error_log $OUTPUT_DIR/yijian-subscription-nginx-error.log warn;
+events { worker_connections 64; }
 http {
-    access_log off;
-    sendfile on;
-    keepalive_timeout 15;
-
-    server {
-        listen $SUB_PORT ssl;
-        listen [::]:$SUB_PORT ssl;
-        server_name $SUB_DOMAIN;
-
-        ssl_certificate $CERT_FILE;
-        ssl_certificate_key $KEY_FILE;
-        ssl_protocols TLSv1.2 TLSv1.3;
-
-        location ~ "^/[0-9a-f]{24}/jhsub\.txt$" {
-            root $SUB_ROOT;
-            default_type text/plain;
-            add_header Cache-Control "no-store" always;
-            try_files \$uri =404;
-        }
-
-        location / {
-            return 404;
-        }
-    }
+  access_log off;
+  sendfile on;
+  keepalive_timeout 15;
+  server {
+    listen $listen_address:$SUB_PORT ssl;
+$ipv6_listen
+    server_name $server_name;
+    ssl_certificate $CERT_FILE;
+    ssl_certificate_key $KEY_FILE;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    location = /$SUB_TOKEN/jhsub.txt { root $SUB_ROOT; default_type text/plain; add_header Cache-Control "no-store" always; }
+    location / { return 404; }
+  }
 }
 EOF
-  if ! nginx_test_output="$("$NGINX_BIN" -t -c "$SUB_NGINX_CONF" 2>&1)"; then
-    printf '%s\n' "$nginx_test_output" >&2
-    die "Nginx HTTPS 订阅配置检查失败，请检查证书、端口或域名"
-  fi
+  chmod 600 "$SUB_NGINX_CONF"; "$NGINX_BIN" -t -c "$SUB_NGINX_CONF" >/dev/null 2>&1 || die "Nginx HTTPS 订阅配置检查失败"
 }
 
-# 将订阅 HTTPS 服务注册为系统服务，确保服务器重启后自动恢复。
 start_subscription_service() {
-  find_nginx_runner || true
-  [[ -n "$NGINX_BIN" ]] || die "未找到可用的 Nginx HTTPS 服务"
-
-  SUB_NGINX_CONF="$OUTPUT_DIR/yijian-subscription-nginx.conf"
-  SUB_NGINX_PID="/run/xray-yijian-sub-nginx.pid"
+  find_nginx_runner || true; [[ -n "$NGINX_BIN" ]] || die "未找到 Nginx"
   write_subscription_nginx_config
-  stop_existing_subscription_service
-
-  # 记录服务参数，供 show 和人工排查使用。
-  printf '%s\n' "$SUB_PORT" > "$OUTPUT_DIR/yijian-subscription-port.txt"
-  printf '%s\n' "$SUB_TOKEN" > "$OUTPUT_DIR/yijian-subscription-token.txt"
-  printf '%s\n' "$SUB_ROOT" > "$OUTPUT_DIR/yijian-subscription-root.txt"
-  printf '%s\n' "$SUB_DOMAIN" > "$OUTPUT_DIR/yijian-subscription-domain.txt"
-  chmod 600 "$OUTPUT_DIR/yijian-subscription-port.txt" "$OUTPUT_DIR/yijian-subscription-token.txt" \
-    "$OUTPUT_DIR/yijian-subscription-root.txt" "$OUTPUT_DIR/yijian-subscription-domain.txt"
-
-  if command_exists systemctl && [[ -d /run/systemd/system ]]; then
+  if [[ "$SERVICE_MODE" == systemd ]]; then
+    systemctl stop xray-yijian-sub.service >/dev/null 2>&1 || true
     cat > /etc/systemd/system/xray-yijian-sub.service <<EOF
 [Unit]
-Description=Xray yijian subscription HTTPS service
-After=network.target
+Description=Xray yijian HTTPS subscription
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -576,391 +358,68 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload || die "systemd 配置加载失败"
-    systemctl enable --now xray-yijian-sub.service || die "systemd 无法启动订阅 HTTPS 服务"
-    systemctl is-active --quiet xray-yijian-sub.service || die "订阅 HTTPS 服务未处于运行状态，请检查端口 $SUB_PORT 是否被占用"
-    SUB_START_MODE="systemd：xray-yijian-sub.service"
-  elif command_exists rc-service && command_exists rc-update; then
-    cat > /etc/init.d/xray-yijian-sub <<EOF
+    systemctl enable xray-yijian-sub.service >/dev/null || die "无法启用订阅服务自启动"
+    systemctl restart xray-yijian-sub.service || die "HTTPS 订阅服务启动失败"
+    systemctl is-active --quiet xray-yijian-sub.service || die "HTTPS 订阅服务未运行"
+    return
+  fi
+  rc-service xray-yijian-sub stop >/dev/null 2>&1 || true
+  cat > /etc/init.d/xray-yijian-sub <<EOF
 #!/sbin/openrc-run
-description="Xray yijian subscription HTTPS service"
+description="Xray yijian HTTPS subscription"
 command="$NGINX_BIN"
 command_args="-c $SUB_NGINX_CONF"
 command_background="yes"
 pidfile="$SUB_NGINX_PID"
-depend() {
-  need net
-}
+depend() { need net; }
 EOF
-    chmod 755 /etc/init.d/xray-yijian-sub
-    rc-update add xray-yijian-sub default >/dev/null 2>&1 || die "OpenRC 无法添加订阅服务自启动"
-    rc-service xray-yijian-sub restart >/dev/null 2>&1 || rc-service xray-yijian-sub start >/dev/null 2>&1 || die "OpenRC 无法启动订阅 HTTPS 服务"
-    rc-service xray-yijian-sub status >/dev/null 2>&1 || die "订阅 HTTPS 服务未处于运行状态，请检查端口 $SUB_PORT 是否被占用"
-    SUB_START_MODE="OpenRC：xray-yijian-sub"
-  else
-    # 无服务管理器时仅能维持当前运行周期，避免虚报“重启后恢复”。
-    nohup "$NGINX_BIN" -c "$SUB_NGINX_CONF" >/dev/null 2>&1 &
-    SUB_PID="$!"
-    sleep 1
-    kill -0 "$SUB_PID" >/dev/null 2>&1 || die "订阅 HTTPS 服务启动后已退出，请检查端口 $SUB_PORT 是否被占用"
-    printf '%s\n' "$SUB_PID" > "$OUTPUT_DIR/xray-yijian-sub.pid"
-    SUB_START_MODE="后台进程：PID $SUB_PID（当前环境没有可用的系统服务管理器，重启后不会自动恢复）"
-  fi
+  chmod 755 /etc/init.d/xray-yijian-sub
+  rc-update add xray-yijian-sub default >/dev/null 2>&1 || die "无法启用订阅服务自启动"
+  rc-service xray-yijian-sub restart >/dev/null 2>&1 || rc-service xray-yijian-sub start >/dev/null 2>&1 || die "HTTPS 订阅服务启动失败"
+  rc-service xray-yijian-sub status >/dev/null 2>&1 || die "HTTPS 订阅服务未运行"
 }
 
-verify_subscription_https() {
-  local local_url="https://${SUB_DOMAIN}:${SUB_PORT}/${SUB_TOKEN}/jhsub.txt"
-  local local_check_url="https://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}/jhsub.txt"
-  local resolve_value="${SUB_DOMAIN}:${SUB_PORT}:127.0.0.1"
-  local response=""
-
+stop_subscription_service() { if [[ "$SERVICE_MODE" == systemd ]]; then systemctl disable --now xray-yijian-sub.service >/dev/null 2>&1 || true; rm -f -- /etc/systemd/system/xray-yijian-sub.service; systemctl daemon-reload >/dev/null 2>&1 || true; else rc-service xray-yijian-sub stop >/dev/null 2>&1 || true; rc-update del xray-yijian-sub default >/dev/null 2>&1 || true; rm -f -- /etc/init.d/xray-yijian-sub; fi; rm -f -- "$OUTPUT_DIR"/yijian-subscription-*.txt "$OUTPUT_DIR/yijian-subscription-nginx.conf"; }
+verify_subscription() {
+  local local_url response="" host_header="$SUB_DOMAIN"
+  if [[ "$SUBSCRIPTION_MODE" == IP ]]; then host_header="$SUB_IP"; [[ "$SUB_HOST_FAMILY" == 6 ]] && local_url="https://[::1]:$SUB_PORT/$SUB_TOKEN/jhsub.txt" || local_url="https://127.0.0.1:$SUB_PORT/$SUB_TOKEN/jhsub.txt"; else [[ "$SUB_PORT" == 443 ]] && local_url="https://$SUB_DOMAIN/$SUB_TOKEN/jhsub.txt" || local_url="https://$SUB_DOMAIN:$SUB_PORT/$SUB_TOKEN/jhsub.txt"; fi
   if command_exists curl; then
-    response="$(curl -fsSk --max-time 5 --resolve "$resolve_value" "$local_url" 2>/dev/null || true)"
-  elif command_exists wget; then
-    response="$(wget --no-check-certificate -qO- --timeout=5 --header="Host: $SUB_DOMAIN" "$local_check_url" 2>/dev/null || true)"
+    if [[ "$SUBSCRIPTION_MODE" == DOMAIN ]]; then response="$(curl -fsSk --noproxy '*' --max-time 8 --resolve "$SUB_DOMAIN:$SUB_PORT:127.0.0.1" "$local_url" 2>/dev/null || true)"; else response="$(curl -fsSk --noproxy '*' --max-time 8 -H "Host: $host_header" "$local_url" 2>/dev/null || true)"; fi
   fi
-  [[ "$response" == vless://* ]] || die "HTTPS 订阅本机检查失败，请检查 Nginx、证书、Token 路径和端口 $SUB_PORT"
+  [[ "$response" == vless://* || "$response" == hysteria2://* ]] || die "本机 HTTPS 订阅检查失败"
 }
 
-[[ "$(id -u)" -eq 0 ]] || die "请使用 root 运行此脚本"
-
-if [[ "${1:-}" == "show" ]]; then
-  show_deployment "${2:-/etc/xray}"
-  exit 0
-fi
-[[ -z "${1:-}" ]] || die "未知参数：$1；查看已生成节点请使用：$SCRIPT_NAME show [输出目录]"
-
-echo "============================================================"
-echo "  $SCRIPT_NAME"
-echo "  独立 Xray：VLESS-Reality + VLESS-XHTTP-TLS 橙云节点"
-echo "============================================================"
-echo
-
-install_dependencies
-XRAY_BIN="$(find_xray || true)"
-if [[ -z "$XRAY_BIN" ]]; then
-  echo "[信息] 未找到 Xray，开始安装 Xray"
-  install_xray
-  XRAY_BIN="$(find_xray || true)"
-  [[ -n "$XRAY_BIN" ]] || die "Xray 安装完成但仍未找到可执行文件"
-  ok "Xray 安装完成：$XRAY_BIN"
-fi
-ok "已找到 Xray：$XRAY_BIN"
-
-echo
-echo "--- 第 1 步：输入节点参数 ---"
-REALITY_CONNECT_HOST=""
-read_deployment_config
-# Reality 伪装参数固定采用 Argosbx 默认值，不再让输入，避免参数混淆。
-REALITY_SNI="apple.com"
-REALITY_DEST="apple.com:443"
-CONFIG_PATH="/etc/xray/config.json"
-OUTPUT_DIR="$(dirname "$CONFIG_PATH")"
-XHTTP_PATH="/xhttp-$(openssl rand -hex 6)"
-
-# 证书和私钥已由一次性配置块读取，脚本自动保存到输出目录。
-CERT_FILE="$OUTPUT_DIR/yijian-origin-cert.pem"
-KEY_FILE="$OUTPUT_DIR/yijian-origin-key.pem"
-
-echo
-echo "--- 第 2 步：校验输入参数 ---"
-validate_port "Reality 端口" "$REALITY_PORT"
-validate_port "XHTTP-TLS 端口" "$XHTTP_PORT"
-validate_port "订阅端口" "$SUB_PORT"
-validate_outbound_ip_version "$OUTBOUND_IP_VERSION"
-OUTBOUND_DOMAIN_STRATEGY="UseIPv${OUTBOUND_IP_VERSION}"
-[[ "$REALITY_PORT" != "$XHTTP_PORT" && "$REALITY_PORT" != "$SUB_PORT" && "$XHTTP_PORT" != "$SUB_PORT" ]] || die "三个端口不能相同"
-validate_domain "橙云源站域名" "$ORIGIN_DOMAIN"
-validate_domain "HTTPS 订阅域名" "$SUB_DOMAIN"
-validate_domain_list
-validate_host_port "Reality 伪装目标" "$REALITY_DEST"
-[[ "$XHTTP_PATH" == /* ]] || XHTTP_PATH="/$XHTTP_PATH"
-[[ "$XHTTP_PATH" =~ ^/[A-Za-z0-9._~/-]+$ ]] || die "XHTTP 路径只能包含字母、数字、/、.、_、~、-"
-
-# Cloudflare 橙云只代理这些 HTTPS 端口，其他端口不能按预期走 CDN。
-case "$XHTTP_PORT" in
-  443|2053|2083|2087|2096|8443) ;;
-  *) die "XHTTP-TLS 端口 $XHTTP_PORT 不是 Cloudflare 橙云支持的端口（443/2053/2083/2087/2096/8443）" ;;
-esac
-
-[[ -f "$CONFIG_PATH" || ! -e "$CONFIG_PATH" ]] || die "配置路径不是普通文件：$CONFIG_PATH"
-mkdir -p -- "$OUTPUT_DIR"
-printf '%s' "$CERT_CONTENT" > "$CERT_FILE"
-printf '%s' "$KEY_CONTENT" > "$KEY_FILE"
-chmod 600 "$CERT_FILE" "$KEY_FILE"
-[[ -r "$CERT_FILE" ]] || die "证书写入失败：$CERT_FILE"
-[[ -r "$KEY_FILE" ]] || die "私钥写入失败：$KEY_FILE"
-
-openssl x509 -in "$CERT_FILE" -noout >/dev/null 2>&1 || die "证书不是有效 PEM X.509 文件：$CERT_FILE"
-openssl pkey -in "$KEY_FILE" -passin pass: -noout >/dev/null 2>&1 || die "私钥不存在或不是未加密私钥：$KEY_FILE"
-openssl x509 -in "$CERT_FILE" -noout -checkhost "$ORIGIN_DOMAIN" >/dev/null 2>&1 || die "证书不包含 XHTTP 源站域名：$ORIGIN_DOMAIN"
-openssl x509 -in "$CERT_FILE" -noout -checkhost "$SUB_DOMAIN" >/dev/null 2>&1 || die "证书不包含 HTTPS 订阅域名：$SUB_DOMAIN"
-
-CERT_PUB_SHA="$(openssl x509 -in "$CERT_FILE" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
-KEY_PUB_SHA="$(openssl pkey -in "$KEY_FILE" -passin pass: -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
-[[ -n "$CERT_PUB_SHA" && "$CERT_PUB_SHA" == "$KEY_PUB_SHA" ]] || die "证书和私钥不匹配"
-ok "端口、域名、路径以及证书私钥校验通过"
-
-echo
-echo "--- 第 3 步：准备 Xray 配置 ---"
-mkdir -p -- "$(dirname "$CONFIG_PATH")"
-TMP_DIR="$(mktemp -d /tmp/xray-vless-setup.XXXXXX)"
-TMP_CONFIG="$TMP_DIR/config.json"
-
-if [[ -e "$CONFIG_PATH" ]]; then
-  jq empty "$CONFIG_PATH" >/dev/null 2>&1 || die "现有 Xray 配置不是有效 JSON，未修改任何文件：$CONFIG_PATH"
-  BASE_CONFIG="$CONFIG_PATH"
-else
-  BASE_CONFIG="$TMP_DIR/base.json"
-  cat > "$BASE_CONFIG" <<'EOF'
-{
-  "log": {"loglevel": "warning"},
-  "inbounds": [],
-  "outbounds": [
-    {"protocol": "freedom", "tag": "direct"},
-    {"protocol": "blackhole", "tag": "block"}
-  ]
-}
-EOF
-fi
-
-UUID_REALITY="$(cat /proc/sys/kernel/random/uuid)"
-UUID_XHTTP="$(cat /proc/sys/kernel/random/uuid)"
-SHORT_ID="$(openssl rand -hex 8)"
-if ! KEY_OUTPUT="$($XRAY_BIN x25519 2>&1)"; then
-  die "Xray x25519 执行失败，请检查 Xray 可执行文件和版本"
-fi
-
-# Xray 的输出格式有多个版本：
-#   Private key: ... / Public key: ...
-#   PrivateKey: ... / Password: ...
-#   PrivateKey: ... / Password (PublicKey): ... / Hash32: ...
-# 其中 Password 是 Reality 公钥，Hash32 不是公钥，不能写入客户端 pbk。
-extract_x25519_value() {
-  local kind="$1"
-  printf '%s\n' "$KEY_OUTPUT" | awk -v kind="$kind" '
-    function emit(value) {
-      gsub(/\r/, "", value)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-      if (value != "") {
-        print value
-        exit
-      }
-    }
-    {
-      for (i = 1; i <= NF; i++) {
-        token = $i
-        if (kind == "private") {
-          if (token == "PrivateKey:" && i < NF) emit($(i + 1))
-          if (token ~ /^PrivateKey:[^[:space:]]+$/) {
-            sub(/^PrivateKey:/, "", token)
-            emit(token)
-          }
-          if (token == "Private" && i < NF) {
-            next_token = $(i + 1)
-            if (next_token == "key:" && i + 1 < NF) emit($(i + 2))
-            if (next_token ~ /^key:[^[:space:]]+$/) {
-              sub(/^key:/, "", next_token)
-              emit(next_token)
-            }
-          }
-        } else {
-          if (token == "Password" && i < NF) {
-            next_token = $(i + 1)
-            if (next_token == "(PublicKey):" && i + 1 < NF) emit($(i + 2))
-            if (next_token ~ /^\(PublicKey\):[^[:space:]]+$/) {
-              sub(/^\(PublicKey\):/, "", next_token)
-              emit(next_token)
-            }
-          }
-          if (token == "Password:" && i < NF) emit($(i + 1))
-          if (token ~ /^Password:[^[:space:]]+$/) {
-            sub(/^Password:/, "", token)
-            emit(token)
-          }
-          if (token == "PublicKey:" && i < NF) emit($(i + 1))
-          if (token ~ /^PublicKey:[^[:space:]]+$/) {
-            sub(/^PublicKey:/, "", token)
-            emit(token)
-          }
-          if (token == "Public" && i < NF) {
-            next_token = $(i + 1)
-            if (next_token == "key:" && i + 1 < NF) emit($(i + 2))
-            if (next_token ~ /^key:[^[:space:]]+$/) {
-              sub(/^key:/, "", next_token)
-              emit(next_token)
-            }
-          }
-        }
-      }
-    }
-  '
+show_port_usage() { if command_exists ss; then ss -lntup; elif command_exists netstat; then netstat -lntup; else printf '未找到 ss 或 netstat，无法显示端口占用\n'; fi; }
+show_deployment() {
+  local output_dir="${1:-$OUTPUT_DIR}" line count=0 url_file="$output_dir/yijian-subscription-url.txt"; [[ -s "$output_dir/vless-links.txt" ]] || die "找不到已生成的节点文件"
+  while IFS= read -r line; do [[ -n "$line" ]] || continue; count=$((count+1)); printf '节点 %s：%s\n' "$count" "$line"; done < "$output_dir/vless-links.txt"; printf '节点总数：%s\n' "$count"; if [[ -s "$url_file" ]]; then printf 'HTTPS 订阅：%s\n' "$(sed -n '1p' "$url_file")"; else printf 'HTTPS 订阅：未启用\n'; fi; show_port_usage
 }
 
-REALITY_PRIVATE_KEY="$(extract_x25519_value private)"
-REALITY_PUBLIC_KEY="$(extract_x25519_value public)"
-[[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" ]] || die "Xray x25519 未返回可识别的私钥/公钥，请检查 Xray 版本"
-
-REALITY_JSON="$(jq -cn \
-  --arg tag "$MANAGED_REALITY_TAG" \
-  --argjson port "$REALITY_PORT" \
-  --arg uuid "$UUID_REALITY" \
-  --arg dest "$REALITY_DEST" \
-  --arg sni "$REALITY_SNI" \
-  --arg private_key "$REALITY_PRIVATE_KEY" \
-  --arg short_id "$SHORT_ID" \
-  '{tag:$tag,port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:"none"},streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:$dest,xver:0,serverNames:[$sni],privateKey:$private_key,shortIds:[$short_id]}},sniffing:{enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:true}}')"
-
-XHTTP_JSON="$(jq -cn \
-  --arg tag "$MANAGED_XHTTP_TAG" \
-  --argjson port "$XHTTP_PORT" \
-  --arg uuid "$UUID_XHTTP" \
-  --arg host "$ORIGIN_DOMAIN" \
-  --arg path "$XHTTP_PATH" \
-  --arg cert "$CERT_FILE" \
-  --arg key "$KEY_FILE" \
-  '{tag:$tag,port:$port,protocol:"vless",settings:{clients:[{id:$uuid}],decryption:"none"},streamSettings:{network:"xhttp",security:"tls",xhttpSettings:{host:$host,path:$path,mode:"auto"},tlsSettings:{minVersion:"1.2",maxVersion:"1.3",alpn:["h2","h3","http/1.1"],certificates:[{certificateFile:$cert,keyFile:$key}]}},sniffing:{enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:true}}')"
-
-jq --argjson reality "$REALITY_JSON" --argjson xhttp "$XHTTP_JSON" \
-  --arg domain_strategy "$OUTBOUND_DOMAIN_STRATEGY" \
-  '.inbounds = ((.inbounds // []) | map(select((.tag // "") != "vless-reality-vision" and (.tag // "") != "vless-xhttp-tls")) + [$reality, $xhttp])
-   | .outbounds = ((.outbounds // [])
-     | map(if (.protocol // "") == "freedom"
-           then .settings = ((.settings // {}) + {domainStrategy:$domain_strategy})
-           else .
-           end)
-     | if any(.[]; (.protocol // "") == "freedom")
-       then .
-       else [{protocol:"freedom",tag:"yijian-direct",settings:{domainStrategy:$domain_strategy}}] + .
-       end)' \
-  "$BASE_CONFIG" > "$TMP_CONFIG" || die "生成 Xray 配置失败"
-jq empty "$TMP_CONFIG" >/dev/null 2>&1 || die "生成的 Xray 配置不是有效 JSON"
-ok "Xray 配置已生成，freedom 出站固定使用 IPv${OUTBOUND_IP_VERSION}；原有其他入站和出站保持不变"
-
-echo
-echo "--- 第 4 步：应用 Xray 配置 ---"
-install -m 600 -- "$TMP_CONFIG" "$CONFIG_PATH"
-ok "Xray 配置已写入：$CONFIG_PATH"
-
-start_xray
-ok "Xray 已启动：$XRAY_START_MODE"
-
-echo
-echo "--- 第 5 步：生成节点和订阅 ---"
-# 按 Argosbx 的方式探测：先 IPv4，IPv4 不可用时再使用 IPv6。
-V46_URL="https://icanhazip.com"
-PUBLIC_IPV4=""
-PUBLIC_IPV6=""
-if command_exists curl; then
-  PUBLIC_IPV4="$(curl -s4m5 -k "$V46_URL" 2>/dev/null | tr -d '[:space:]' || true)"
-  PUBLIC_IPV6="$(curl -s6m5 -k "$V46_URL" 2>/dev/null | tr -d '[:space:]' || true)"
-else
-  PUBLIC_IPV4="$(timeout 5 wget -4 --tries=2 -qO- "$V46_URL" 2>/dev/null | tr -d '[:space:]' || true)"
-  PUBLIC_IPV6="$(timeout 5 wget -6 --tries=2 -qO- "$V46_URL" 2>/dev/null | tr -d '[:space:]' || true)"
-fi
-PUBLIC_HOSTS=()
-if [[ "$PUBLIC_IPV4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-  PUBLIC_HOSTS+=("$PUBLIC_IPV4")
-fi
-if [[ "$PUBLIC_IPV6" == *:* ]]; then
-  PUBLIC_HOSTS+=("[$PUBLIC_IPV6]")
-fi
-(( ${#PUBLIC_HOSTS[@]} > 0 )) || die "未能探测公网 IPv4 或 IPv6"
-IP_FAMILY=""
-[[ -n "$PUBLIC_IPV4" ]] && IP_FAMILY="IPv4"
-[[ -n "$PUBLIC_IPV6" ]] && IP_FAMILY="${IP_FAMILY:+$IP_FAMILY/}IPv6"
-ok "检测到公网地址：$IP_FAMILY；将生成 ${#PUBLIC_HOSTS[@]} 个 Reality 节点"
-
-REALITY_SNI_ENC="$(urlencode "$REALITY_SNI")"
-REALITY_PUBLIC_ENC="$(urlencode "$REALITY_PUBLIC_KEY")"
-SHORT_ID_ENC="$(urlencode "$SHORT_ID")"
-ORIGIN_ENC="$(urlencode "$ORIGIN_DOMAIN")"
-PATH_ENC="$(urlencode "$XHTTP_PATH")"
-declare -A NODE_LINK_BASE=()
-declare -A NODE_BASE_NAME=()
-declare -A NODE_ORDER_USED=()
-NODE_GENERATION_ORDER=()
-
-if [[ -n "$PUBLIC_IPV4" ]]; then
-  NODE_LINK_BASE[REALITY_V4]="vless://${UUID_REALITY}@${PUBLIC_IPV4}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI_ENC}&fp=chrome&pbk=${REALITY_PUBLIC_ENC}&sid=${SHORT_ID_ENC}&type=tcp&headerType=none"
-  NODE_BASE_NAME[REALITY_V4]="${NODE_NAME_PREFIX}V4-直连"
-  NODE_GENERATION_ORDER+=(REALITY_V4)
-fi
-if [[ -n "$PUBLIC_IPV6" ]]; then
-  NODE_LINK_BASE[REALITY_V6]="vless://${UUID_REALITY}@[${PUBLIC_IPV6}]:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI_ENC}&fp=chrome&pbk=${REALITY_PUBLIC_ENC}&sid=${SHORT_ID_ENC}&type=tcp&headerType=none"
-  NODE_BASE_NAME[REALITY_V6]="${NODE_NAME_PREFIX}V6-直连"
-  NODE_GENERATION_ORDER+=(REALITY_V6)
-fi
-
-for preferred_index in "${!PREFERRED_DOMAINS[@]}"; do
-  preferred_node_id="CDN_$((preferred_index + 1))"
-  PREFERRED_DOMAIN="${PREFERRED_DOMAINS[$preferred_index]}"
-  NODE_LINK_BASE["$preferred_node_id"]="vless://${UUID_XHTTP}@${PREFERRED_DOMAIN}:${XHTTP_PORT}?encryption=none&security=tls&sni=${ORIGIN_ENC}&host=${ORIGIN_ENC}&type=xhttp&path=${PATH_ENC}&mode=auto"
-  NODE_BASE_NAME["$preferred_node_id"]="${NODE_NAME_PREFIX}V4-CDN-${PREFERRED_DOMAIN}-直连"
-  NODE_GENERATION_ORDER+=("$preferred_node_id")
-done
-
-NODE_LINES=()
-node_number=0
-for node_id in "${NODE_ORDER_IDS[@]}"; do
-  if [[ -z "${NODE_LINK_BASE[$node_id]+x}" ]]; then
-    if [[ "$node_id" == CDN_* ]]; then
-      die "NODE_ORDER 中的 $node_id 没有对应的 PREFERRED_DOMAIN_N"
-    fi
-    warn "NODE_ORDER 中的 $node_id 当前没有可用公网地址，已跳过"
-    continue
-  fi
-  node_number=$((node_number + 1))
-  node_order_prefix="$(printf '%02d' "$node_number")-"
-  node_display_name="${node_order_prefix}${NODE_BASE_NAME[$node_id]}"
-  node_display_name_enc="$(urlencode "$node_display_name")"
-  NODE_LINES+=("${NODE_LINK_BASE[$node_id]}#${node_display_name_enc}")
-  NODE_ORDER_USED["$node_id"]=1
-done
-
-for node_id in "${NODE_GENERATION_ORDER[@]}"; do
-  [[ -n "${NODE_ORDER_USED[$node_id]+x}" ]] || die "实际生成的节点 $node_id 未在 NODE_ORDER 中配置"
-done
-
-LINK_FILE="$OUTPUT_DIR/vless-links.txt"
-printf '%s\n' "${NODE_LINES[@]}" > "$LINK_FILE"
-SUB_TOKEN="$(openssl rand -hex 12)"
-SUB_ROOT="$OUTPUT_DIR/xray-sub"
-SUB_DIR="$SUB_ROOT/$SUB_TOKEN"
-SUB_FILE="$SUB_DIR/jhsub.txt"
-SUB_PLAIN="$SUB_DIR/nodes.txt"
-mkdir -p -- "$SUB_DIR"
-printf '%s\n' "${NODE_LINES[@]}" > "$SUB_FILE"
-cp -- "$SUB_FILE" "$SUB_PLAIN"
-chmod 600 "$LINK_FILE"
-chmod 640 "$SUB_FILE" "$SUB_PLAIN"
-chown root:nginx "$SUB_ROOT" "$SUB_DIR" "$SUB_FILE" "$SUB_PLAIN" 2>/dev/null || die "无法设置订阅文件属主"
-chmod 750 "$SUB_ROOT" "$SUB_DIR"
-ok "节点链接已写入：$LINK_FILE"
-
-echo
-echo "--- 第 6 步：启动订阅 HTTPS 服务 ---"
-SUB_URL="https://${SUB_DOMAIN}/${SUB_TOKEN}/jhsub.txt"
-SUB_URL_FILE="$OUTPUT_DIR/yijian-subscription-url.txt"
-printf '%s\n' "$SUB_URL" > "$SUB_URL_FILE"
-chmod 600 "$SUB_URL_FILE"
-start_subscription_service
-verify_subscription_https
-ok "订阅服务已启动：$SUB_START_MODE"
-ok "订阅网址已保存：$SUB_URL_FILE"
-
-echo
-echo "============================================================"
-echo "部署完成"
-echo "============================================================"
-echo "节点总数：${#NODE_LINES[@]}（Reality=${#PUBLIC_HOSTS[@]}，CDN=${#PREFERRED_DOMAINS[@]}）"
-printf '%s\n' "${NODE_LINES[@]}"
-echo ""
-echo "订阅链接（网址）：$SUB_URL"
-echo "订阅文件（明文 jhsub.txt）：$SUB_FILE"
-echo "Xray 配置：$CONFIG_PATH"
-echo "占用端口：Reality=$REALITY_PORT，XHTTP-TLS=$XHTTP_PORT，订阅HTTPS源站=$SUB_PORT"
-echo "整体出站：IPv${OUTBOUND_IP_VERSION}（$OUTBOUND_DOMAIN_STRATEGY）"
-echo ""
-echo "注意：XHTTP 源站域名、Host 和 SNI 为 $ORIGIN_DOMAIN；HTTPS 订阅域名为 $SUB_DOMAIN。"
-echo "注意：Cloudflare Origin Rules 应将 $SUB_DOMAIN:443 回源到源站端口 $SUB_PORT。"
-echo "注意：Reality 伪装域名和目标均为 apple.com，采用 Argosbx 默认设置。"
+main() {
+  [[ "$(id -u)" -eq 0 ]] || die "请使用 root 运行此脚本"
+  if [[ "${1:-}" == show ]]; then show_deployment "${2:-$OUTPUT_DIR}"; return; fi
+  [[ -z "${1:-}" ]] || die "未知参数：$1；可用参数为 show [输出目录]"
+  detect_platform
+  printf 'NAT 一键部署 %s（服务管理：%s，依赖管理：%s）\n' "$SCRIPT_VERSION" "$SERVICE_MODE" "$PACKAGE_MANAGER"
+  read_deployment_config
+  validate_deployment_config
+  TMP_DIR="$(mktemp -d /tmp/xray-yijian.XXXXXX)" || die "无法创建临时目录"
+  install_dependencies
+  XRAY_BIN="$(find_xray || true)"; if [[ -z "$XRAY_BIN" ]]; then install_xray; fi
+  mkdir -p -- "$OUTPUT_DIR"
+  (( CERT_REQUIRED == 0 )) || prepare_certificate
+  prepare_base_config
+  build_nodes
+  merge_xray_config
+  install -m 600 "$TMP_CONFIG" "$CONFIG_PATH"
+  configure_hy2_hop_service
+  start_xray_service
+  printf '%s\n' "${NODE_LINES[@]}" > "$OUTPUT_DIR/vless-links.txt"; chmod 600 "$OUTPUT_DIR/vless-links.txt"
+  if (( SUBSCRIPTION_ENABLED == 1 )); then write_subscription_files; start_subscription_service; verify_subscription; else stop_subscription_service; fi
+  if (( SUBSCRIPTION_ENABLED == 1 )); then ok "${#NODE_IDS[@]} 个节点和 HTTPS 订阅已部署"; else ok "${#NODE_IDS[@]} 个节点已部署，HTTPS 订阅未启用"; fi
+  printf '%s\n' "${NODE_LINES[@]}"
+  (( SUBSCRIPTION_ENABLED == 1 )) && printf '订阅网址：%s\n' "$SUB_URL" || printf '订阅网址：未启用\n'
+  for index in "${HY2_IDS[@]}"; do printf '节点 %s 的 HY2 UDP 跳跃范围：%s:%s\n' "$index" "${NODE_HY2_STARTS[$index]}" "${NODE_HY2_ENDS[$index]}"; done
+  printf '节点文件：%s/vless-links.txt\n' "$OUTPUT_DIR"
+}
+main "$@"
