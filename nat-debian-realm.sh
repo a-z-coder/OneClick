@@ -19,7 +19,7 @@ fi
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 SERVICE_NAME="nat-debian-realm"
 INSTALL_ROOT="/etc/realm/nat-debian-realm"
 CONFIG_PATH="$INSTALL_ROOT/config.toml"
@@ -366,8 +366,9 @@ install_realm() {
   actual_digest="$(sha256sum "$archive" | awk '{print $1}')"
   [[ "$actual_digest" == "$asset_digest" ]] || die "Realm 文件 SHA-256 校验失败"
   tar -xzf "$archive" -C "$extract_dir" || die "解压 Realm 失败"
-  realm_file="$(find "$extract_dir" -type f -name realm -print -quit)"
-  [[ -n "$realm_file" && -f "$realm_file" ]] || die "解压后没有找到 Realm 可执行文件"
+  # Official slim archives contain realm-slim; also accept the realm filename.
+  realm_file="$(find "$extract_dir" -type f \( -name realm-slim -o -name realm \) -print -quit)" || die "无法查找解压后的 Realm 可执行文件"
+  [[ -n "$realm_file" && -f "$realm_file" ]] || die "解压 $asset_name 后没有找到 realm-slim 或 realm 可执行文件"
   STAGED_REALM_BIN="$TMP_DIR/realm.new"
   install -m 755 "$realm_file" "$STAGED_REALM_BIN" || die "准备 Realm 二进制失败"
   env -u REALM_CONF "$STAGED_REALM_BIN" --version >/dev/null 2>&1 || die "下载的 Realm 无法运行"
