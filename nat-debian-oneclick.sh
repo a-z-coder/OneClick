@@ -8,7 +8,7 @@ fi
 set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="2.1.6"
+SCRIPT_VERSION="2.2.0"
 OUTPUT_DIR="/etc/xray"
 CONFIG_PATH="$OUTPUT_DIR/config.json"
 SUB_ROOT="$OUTPUT_DIR/xray-sub"
@@ -46,7 +46,7 @@ declare -A CONFIG_VALUES=()
 declare -a NODE_IDS=() NODE_TYPES=() NODE_PORTS=() NODE_ENTRY_IPS=() NODE_EXIT_IPS=()
 declare -a NODE_NAMES=() NODE_IP_FAMILIES=() NODE_EXIT_FAMILIES=()
 declare -a NODE_HY2_STARTS=() NODE_HY2_ENDS=() NODE_HY2_PASSWORDS=()
-declare -a HY2_IDS=() NODE_LINES=() NEW_INBOUNDS=() NEW_OUTBOUNDS=() NEW_RULES=()
+declare -a HY2_IDS=() HY2_HOP_IDS=() NODE_LINES=() NEW_INBOUNDS=() NEW_OUTBOUNDS=() NEW_RULES=()
 
 cleanup() { [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]] || { rm -f -- "$TMP_DIR"/* 2>/dev/null || true; rmdir -- "$TMP_DIR" 2>/dev/null || true; }; }
 trap cleanup EXIT
@@ -81,7 +81,7 @@ read_deployment_config() {
       field="${BASH_REMATCH[1]}"
       if [[ "$field" == TYPE ]]; then node_index=$((node_index + 1)); elif (( node_index == 0 )); then die "NODE_TYPE 必须放在每个节点配置的第一行"; fi
       key="NODE_${node_index}_${field}"
-    elif [[ "$key" != SUBSCRIPTION_MODE && "$key" != SUB_DOMAIN && "$key" != SUB_IP && "$key" != SUB_PORT && "$key" != SUB_TOKEN ]]; then
+    elif [[ "$key" != SUBSCRIPTION_MODE && "$key" != SUB_DOMAIN && "$key" != SUB_IP && "$key" != SUB_PORT && "$key" != SUB_TOKEN && "$key" != REALITY_SNI && "$key" != REALITY_DEST ]]; then
       die "未知配置项：$key"
     fi
     [[ -z "${CONFIG_VALUES[$key]+x}" ]] || die "配置项重复：$key"
@@ -108,23 +108,31 @@ ip_family() { validate_ipv4 "$1" && { printf 4; return; }; validate_ipv6 "$1" &&
 
 validate_deployment_config() {
   local index prefix type port entry exit range start end password sni key field subscription_mode expected=1 other
-  local -a raw_indices=(); declare -A used_ports=()
+  local -a raw_indices=(); declare -A used_ports=() used_port_types=()
+  REALITY_SNI="$(config_value REALITY_SNI)"; [[ -n "$REALITY_SNI" ]] || REALITY_SNI="apple.com"; validate_domain "REALITY_SNI" "$REALITY_SNI"
+  REALITY_DEST="$(config_value REALITY_DEST)"; [[ -n "$REALITY_DEST" ]] || REALITY_DEST="${REALITY_SNI}:443"
+  [[ "$REALITY_DEST" =~ ^[^:]+:[1-9][0-9]{0,4}$ ]] || die "REALITY_DEST 必须是 域名:端口"
   for key in "${!CONFIG_VALUES[@]}"; do [[ "$key" =~ ^NODE_([1-9][0-9]*)_ ]] && raw_indices+=("${BASH_REMATCH[1]}"); done
   (( ${#raw_indices[@]} > 0 )) || die "配置中没有节点"
   mapfile -t NODE_IDS < <(printf '%s\n' "${raw_indices[@]}" | sort -nu)
   for index in "${NODE_IDS[@]}"; do [[ "$index" == "$expected" ]] || die "节点编号必须从 1 连续递增，缺少 NODE_${expected}"; expected=$((expected+1)); done
   for index in "${NODE_IDS[@]}"; do
     prefix="NODE_${index}"; type="$(required_value "${prefix}_TYPE")"; NODE_TYPES[$index]="$type"; NODE_NAMES[$index]="$(required_value "${prefix}_NAME")"
-    for key in "${!CONFIG_VALUES[@]}"; do [[ "$key" == "${prefix}_"* ]] || continue; field="${key#${prefix}_}"; case "$type" in REALITY) [[ "$field" =~ ^(TYPE|PORT|ENTRY_IP|EXIT_IP|NAME)$ ]] || die "节点 $index 的 REALITY 不使用 $field";; CDN) [[ "$field" =~ ^(TYPE|PORT|PREFERRED_DOMAIN|ORIGIN_DOMAIN|NAME)$ ]] || die "节点 $index 的 CDN 不使用 $field";; HY2) [[ "$field" =~ ^(TYPE|PORT_RANGE|ENTRY_IP|EXIT_IP|SNI|PASSWORD|NAME)$ ]] || die "节点 $index 的 HY2 不使用 $field";; *) die "节点 $index 的 TYPE 只能是 REALITY、CDN 或 HY2";; esac; done
+    for key in "${!CONFIG_VALUES[@]}"; do [[ "$key" == "${prefix}_"* ]] || continue; field="${key#${prefix}_}"; case "$type" in REALITY) [[ "$field" =~ ^(TYPE|PORT|ENTRY_IP|EXIT_IP|NAME)$ ]] || die "节点 $index 的 REALITY 不使用 $field";; CDN) [[ "$field" =~ ^(TYPE|PORT|PREFERRED_DOMAIN|ORIGIN_DOMAIN|NAME)$ ]] || die "节点 $index 的 CDN 不使用 $field";; HY2) [[ "$field" =~ ^(TYPE|PORT|PORT_RANGE|ENTRY_IP|EXIT_IP|SNI|PASSWORD|NAME)$ ]] || die "节点 $index 的 HY2 不使用 $field";; *) die "节点 $index 的 TYPE 只能是 REALITY、CDN 或 HY2";; esac; done
     case "$type" in
       REALITY) port="$(required_value "${prefix}_PORT")"; validate_port "节点 $index 的 Reality 端口" "$port"; entry="$(required_value "${prefix}_ENTRY_IP")"; exit="$(required_value "${prefix}_EXIT_IP")"; ;;
       CDN) port="$(required_value "${prefix}_PORT")"; validate_port "节点 $index 的 CDN 端口" "$port"; validate_domain "节点 $index 的优选域名" "$(required_value "${prefix}_PREFERRED_DOMAIN")"; validate_domain "节点 $index 的源站域名" "$(required_value "${prefix}_ORIGIN_DOMAIN")"; case "$port" in 443|2053|2083|2087|2096|8443);; *) die "节点 $index 的 CDN 端口不是 Cloudflare 支持的端口";; esac; CERT_REQUIRED=1; ;;
-      HY2) range="$(required_value "${prefix}_PORT_RANGE")"; [[ "$range" =~ ^([1-9][0-9]{0,4}):([1-9][0-9]{0,4})$ ]] || die "节点 $index 的 PORT_RANGE 必须是 起始端口:结束端口"; start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"; validate_port "节点 $index 的 HY2 起始端口" "$start"; validate_port "节点 $index 的 HY2 结束端口" "$end"; (( end > start )) || die "节点 $index 的 HY2 结束端口必须大于起始端口"; port="$start"; NODE_HY2_STARTS[$index]="$start"; NODE_HY2_ENDS[$index]="$end"; HY2_IDS+=("$index"); entry="$(required_value "${prefix}_ENTRY_IP")"; exit="$(required_value "${prefix}_EXIT_IP")"; sni="$(required_value "${prefix}_SNI")"; validate_domain "节点 $index 的 HY2 SNI" "$sni"; password="$(required_value "${prefix}_PASSWORD")"; [[ "$password" == AUTO || "$password" =~ ^[A-Za-z0-9._~-]{8,128}$ ]] || die "节点 $index 的 HY2 密码格式不正确"; NODE_HY2_PASSWORDS[$index]="$password"; CERT_REQUIRED=1; ;;
+      HY2) if [[ -n "${CONFIG_VALUES[${prefix}_PORT]+x}" && -n "${CONFIG_VALUES[${prefix}_PORT_RANGE]+x}" ]]; then die "节点 $index 不能同时配置 PORT 和 PORT_RANGE"; fi; if [[ -n "${CONFIG_VALUES[${prefix}_PORT]+x}" ]]; then port="$(required_value "${prefix}_PORT")"; validate_port "节点 $index 的 HY2 端口" "$port"; start="$port"; end="$port"; else range="$(required_value "${prefix}_PORT_RANGE")"; [[ "$range" =~ ^([1-9][0-9]{0,4}):([1-9][0-9]{0,4})$ ]] || die "节点 $index 的 PORT_RANGE 必须是 起始端口:结束端口"; start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"; validate_port "节点 $index 的 HY2 起始端口" "$start"; validate_port "节点 $index 的 HY2 结束端口" "$end"; (( end > start )) || die "节点 $index 的 HY2 结束端口必须大于起始端口"; port="$start"; fi; NODE_HY2_STARTS[$index]="$start"; NODE_HY2_ENDS[$index]="$end"; HY2_IDS+=("$index"); entry="$(required_value "${prefix}_ENTRY_IP")"; exit="$(required_value "${prefix}_EXIT_IP")"; sni="$(required_value "${prefix}_SNI")"; validate_domain "节点 $index 的 HY2 SNI" "$sni"; password="$(required_value "${prefix}_PASSWORD")"; [[ "$password" == AUTO || "$password" =~ ^[A-Za-z0-9._~-]{8,128}$ ]] || die "节点 $index 的 HY2 密码格式不正确"; NODE_HY2_PASSWORDS[$index]="$password"; CERT_REQUIRED=1; ;;
       *) die "节点 $index 的 TYPE 只能是 REALITY、CDN 或 HY2";;
     esac
     NODE_PORTS[$index]="$port"
     if [[ "$type" == REALITY || "$type" == HY2 ]]; then NODE_ENTRY_IPS[$index]="$entry"; NODE_EXIT_IPS[$index]="$exit"; NODE_IP_FAMILIES[$index]="$(ip_family "$entry")" || die "节点 $index 的入口 IP 无效"; NODE_EXIT_FAMILIES[$index]="$(ip_family "$exit")" || die "节点 $index 的出口 IP 无效"; [[ "$entry" != 0.0.0.0 && "$entry" != :: && "$exit" != 0.0.0.0 && "$exit" != :: ]] || die "节点 $index 的 IP 不能是未指定地址"; fi
-    [[ -z "${used_ports[$port]+x}" ]] || die "节点 $index 的端口 $port 与节点 ${used_ports[$port]} 重复"; used_ports[$port]="$index"
+    if [[ -n "${used_ports[$port]+x}" ]]; then
+      [[ "${used_port_types[$port]}" == "$type" ]] || die "节点 $index 的端口 $port 已被 ${used_port_types[$port]} 节点使用，协议不同不能复用"
+      warn "节点 $index 的端口 $port 与节点 ${used_ports[$port]} 重复，将复用优先节点监听配置"
+    else
+      used_ports[$port]="$index"; used_port_types[$port]="$type"
+    fi
   done
   subscription_mode="$(config_value SUBSCRIPTION_MODE)"; if [[ -z "$subscription_mode" ]]; then [[ -n "${CONFIG_VALUES[SUB_DOMAIN]+x}" ]] && subscription_mode=DOMAIN || subscription_mode=NONE; fi; SUB_DOMAIN=""; SUB_IP=""; SUB_PORT=""; SUB_TOKEN=""
   case "$subscription_mode" in
@@ -139,7 +147,8 @@ validate_deployment_config() {
     start="${NODE_HY2_STARTS[$index]}"; end="${NODE_HY2_ENDS[$index]}"
     (( SUBSCRIPTION_ENABLED == 0 || SUB_PORT < start || SUB_PORT > end )) || die "订阅端口落在节点 $index 的 HY2 跳跃范围内"
     for other in "${NODE_IDS[@]}"; do [[ "$other" == "$index" ]] && continue; port="${NODE_PORTS[$other]}"; (( port < start || port > end )) || die "节点 $other 的端口落在节点 $index 的 HY2 跳跃范围内"; done
-    for other in "${HY2_IDS[@]}"; do [[ "$other" -gt "$index" ]] || continue; (( ${NODE_HY2_STARTS[$other]} > end || ${NODE_HY2_ENDS[$other]} < start )) || die "节点 $index 与节点 $other 的 HY2 跳跃范围重叠"; done
+    for other in "${HY2_IDS[@]}"; do [[ "$other" -gt "$index" ]] || continue; (( ${NODE_HY2_STARTS[$other]} == start && ${NODE_HY2_ENDS[$other]} == end )) || (( ${NODE_HY2_STARTS[$other]} > end || ${NODE_HY2_ENDS[$other]} < start )) || die "节点 $index 与节点 $other 的 HY2 跳跃范围重叠"; done
+    (( start < end )) && HY2_HOP_IDS+=("$index")
   done
 }
 
@@ -150,20 +159,21 @@ detect_platform() {
 find_nginx_runner() { if command_exists nginx && nginx -v >/dev/null 2>&1; then NGINX_BIN="$(command -v nginx)"; return; fi; NGINX_BIN=""; return 1; }
 find_xray() { local c; command_exists xray && { command -v xray; return; }; for c in /usr/local/bin/xray /usr/bin/xray /usr/local/sbin/xray; do [[ -x "$c" ]] && { printf '%s' "$c"; return; }; done; return 1; }
 install_dependencies() {
-  local -a packages=(jq openssl unzip coreutils curl ca-certificates); (( SUBSCRIPTION_ENABLED == 1 )) && packages+=(nginx); (( ${#HY2_IDS[@]} > 0 )) && packages+=(nftables)
+  local -a packages=(jq openssl unzip coreutils curl ca-certificates); (( SUBSCRIPTION_ENABLED == 1 )) && packages+=(nginx); (( ${#HY2_HOP_IDS[@]} > 0 )) && packages+=(nftables)
   local -a missing=(); local p; for p in "${packages[@]}"; do case "$p" in jq) command_exists jq || missing+=("$p");; openssl) command_exists openssl || missing+=("$p");; unzip) command_exists unzip || missing+=("$p");; coreutils) command_exists sha256sum || missing+=("$p");; curl) command_exists curl || missing+=("$p");; ca-certificates) [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing+=("$p");; nginx) command_exists nginx || missing+=("$p");; nftables) command_exists nft || missing+=("$p");; esac; done
   if (( ${#missing[@]} > 0 )); then
     info "安装缺少的工具：${missing[*]}"
     if [[ "$PACKAGE_MANAGER" == apk ]]; then apk add --no-cache "${missing[@]}" || die "Alpine 依赖安装失败"; else apt-get update || die "APT 软件源更新失败"; DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" || die "APT 依赖安装失败"; fi
+    printf '%s\n' "${missing[@]}" >> "$OUTPUT_DIR/yijian-install/packages-installed.txt"
   fi
-  command_exists jq && command_exists openssl && command_exists sha256sum && { command_exists curl || command_exists wget; } || die "依赖安装后仍缺少必需工具"; (( SUBSCRIPTION_ENABLED == 0 )) || find_nginx_runner || die "订阅模式需要 Nginx"; (( ${#HY2_IDS[@]} == 0 )) || command_exists nft || die "HY2 需要 nftables";
+  command_exists jq && command_exists openssl && command_exists sha256sum && { command_exists curl || command_exists wget; } || die "依赖安装后仍缺少必需工具"; (( SUBSCRIPTION_ENABLED == 0 )) || find_nginx_runner || die "订阅模式需要 Nginx"; (( ${#HY2_HOP_IDS[@]} == 0 )) || command_exists nft || die "HY2 跳跃需要 nftables";
   if (( SUBSCRIPTION_ENABLED == 1 )); then
     if id nginx >/dev/null 2>&1; then NGINX_USER=nginx; NGINX_GROUP=nginx; elif id www-data >/dev/null 2>&1; then NGINX_USER=www-data; NGINX_GROUP=www-data; else die "找不到 Nginx 运行用户"; fi
     if [[ "$SERVICE_MODE" == systemd ]]; then systemctl disable --now nginx.service >/dev/null 2>&1 || true; else rc-service nginx stop >/dev/null 2>&1 || true; rc-update del nginx default >/dev/null 2>&1 || true; fi
   fi
 }
 
-install_xray() { local asset archive extract_dir; case "$(uname -m)" in x86_64|amd64) asset=Xray-linux-64.zip;; aarch64|arm64) asset=Xray-linux-arm64-v8a.zip;; *) die "当前架构不受 Xray 支持";; esac; archive="$(mktemp /tmp/xray.XXXXXX)"; extract_dir="$(mktemp -d /tmp/xray-core.XXXXXX)"; if command_exists curl; then curl -fL "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" -o "$archive" || die "下载 Xray 失败"; else wget -O "$archive" "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" || die "下载 Xray 失败"; fi; unzip -j "$archive" xray -d "$extract_dir" >/dev/null || die "解压 Xray 失败"; install -m 755 "$extract_dir/xray" /usr/local/bin/xray || die "安装 Xray 失败"; rm -f "$archive" "$extract_dir/xray"; rmdir "$extract_dir" 2>/dev/null || true; XRAY_BIN=/usr/local/bin/xray; "$XRAY_BIN" version >/dev/null 2>&1 || die "安装后的 Xray 无法运行"; }
+install_xray() { local asset archive extract_dir; case "$(uname -m)" in x86_64|amd64) asset=Xray-linux-64.zip;; aarch64|arm64) asset=Xray-linux-arm64-v8a.zip;; *) die "当前架构不受 Xray 支持";; esac; archive="$(mktemp /tmp/xray.XXXXXX)"; extract_dir="$(mktemp -d /tmp/xray-core.XXXXXX)"; if command_exists curl; then curl -fL "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" -o "$archive" || die "下载 Xray 失败"; else wget -O "${archive}" "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" || die "下载 Xray 失败"; fi; unzip -j "$archive" xray -d "$extract_dir" >/dev/null || die "解压 Xray 失败"; install -m 755 "$extract_dir/xray" /usr/local/bin/xray || die "安装 Xray 失败"; : > "$OUTPUT_DIR/yijian-install/xray-installed-by-yijian"; rm -f "$archive" "$extract_dir/xray"; rmdir "$extract_dir" 2>/dev/null || true; XRAY_BIN=/usr/local/bin/xray; "$XRAY_BIN" version >/dev/null 2>&1 || die "安装后的 Xray 无法运行"; }
 
 prepare_certificate() {
   local cert_pub key_pub domain index; printf '%s\n' "$CERT_CONTENT" > "$TMP_DIR/cert.pem"; printf '%s\n' "$KEY_CONTENT" > "$TMP_DIR/key.pem"; openssl x509 -in "$TMP_DIR/cert.pem" -noout >/dev/null 2>&1 || die "证书不是有效 PEM X.509"; openssl pkey -in "$TMP_DIR/key.pem" -passin pass: -noout >/dev/null 2>&1 || die "私钥无效或带密码"; if [[ "$SUBSCRIPTION_MODE" == DOMAIN ]]; then openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkhost "$SUB_DOMAIN" >/dev/null 2>&1 || die "证书不包含订阅域名"; fi; for index in "${NODE_IDS[@]}"; do case "${NODE_TYPES[$index]}" in CDN) domain="$(config_value "NODE_${index}_ORIGIN_DOMAIN")";; HY2) domain="$(config_value "NODE_${index}_SNI")";; *) continue;; esac; openssl x509 -in "$TMP_DIR/cert.pem" -noout -checkhost "$domain" >/dev/null 2>&1 || die "证书不包含节点 $index 的域名"; done; cert_pub="$(openssl x509 -in "$TMP_DIR/cert.pem" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; key_pub="$(openssl pkey -in "$TMP_DIR/key.pem" -passin pass: -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || die "证书和私钥不匹配"; CERT_SHA256="$(openssl x509 -in "$TMP_DIR/cert.pem" -outform DER | sha256sum | awk '{print $1}')"; CERT_FILE="$OUTPUT_DIR/yijian-origin-cert.pem"; KEY_FILE="$OUTPUT_DIR/yijian-origin-key.pem"; install -m 600 "$TMP_DIR/cert.pem" "$CERT_FILE"; install -m 600 "$TMP_DIR/key.pem" "$KEY_FILE";
@@ -177,15 +187,30 @@ EOF
   fi; }
 
 build_nodes() {
-  local index prefix type port tag outtag entry exit family name uuid short_id private_key public_key reality_json outbound_json rule_json link listen origin preferred path_enc origin_enc password sni
+  local index prefix type port tag outtag entry exit family name uuid short_id private_key public_key reality_json outbound_json rule_json link listen origin preferred path_enc origin_enc password sni duplicate_key
+  declare -A FIRST_UUID=() FIRST_PUBLIC=() FIRST_SHORT=() FIRST_PASSWORD=() FIRST_TAG=() FIRST_OUTTAG=()
   REALITY_SNI_ENC="$(urlencode "$REALITY_SNI")"; XHTTP_PATH="/xhttp-$(openssl rand -hex 6)"; path_enc="$(urlencode "$XHTTP_PATH")"; NEW_INBOUNDS=(); NEW_OUTBOUNDS=(); NEW_RULES=(); NODE_LINES=()
   for index in "${NODE_IDS[@]}"; do prefix="NODE_${index}"; type="${NODE_TYPES[$index]}"; port="${NODE_PORTS[$index]}"; name="${NODE_NAMES[$index]}"; tag="yijian-in-$index"; outtag="yijian-out-$index"; listen="0.0.0.0"; [[ "$type" == CDN || "${NODE_IP_FAMILIES[$index]:-4}" == 6 ]] && listen="::";
     case "$type" in
       REALITY) entry="${NODE_ENTRY_IPS[$index]}"; family="${NODE_EXIT_FAMILIES[$index]}"; uuid="$(cat /proc/sys/kernel/random/uuid)"; short_id="$(openssl rand -hex 8)"; KEY_OUTPUT="$($XRAY_BIN x25519 2>&1)" || die "节点 $index 的 Reality 密钥生成失败"; private_key="$(extract_x25519_value private)"; public_key="$(extract_x25519_value public)"; [[ -n "$private_key" && -n "$public_key" ]] || die "节点 $index 的 Reality 密钥无法识别"; reality_json="$(jq -cn --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg uuid "$uuid" --arg dest "$REALITY_DEST" --arg sni "$REALITY_SNI" --arg pk "$private_key" --arg sid "$short_id" '{tag:$tag,listen:$listen,port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:"none"},streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:$dest,xver:0,serverNames:[$sni],privateKey:$pk,shortIds:[$sid]}}}')"; outbound_json="$(jq -cn --arg tag "$outtag" --arg strategy "UseIPv$family" '{tag:$tag,protocol:"freedom",settings:{domainStrategy:$strategy}}')"; link="vless://$uuid@$(url_host "$entry"):$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_SNI_ENC&fp=chrome&pbk=$(urlencode "$public_key")&sid=$short_id&type=tcp&headerType=none#$(urlencode "$name")";;
       CDN) preferred="$(config_value "${prefix}_PREFERRED_DOMAIN")"; origin="$(config_value "${prefix}_ORIGIN_DOMAIN")"; uuid="$(cat /proc/sys/kernel/random/uuid)"; reality_json="$(jq -cn --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg uuid "$uuid" --arg path "$XHTTP_PATH" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '{tag:$tag,listen:$listen,port:$port,protocol:"vless",settings:{clients:[{id:$uuid}],decryption:"none"},streamSettings:{network:"xhttp",security:"tls",xhttpSettings:{path:$path,mode:"auto"},tlsSettings:{alpn:["h2","http/1.1"],certificates:[{certificateFile:$cert,keyFile:$key}]}}}')"; outbound_json="$(jq -cn --arg tag "$outtag" '{tag:$tag,protocol:"freedom",settings:{domainStrategy:"AsIs"}}')"; origin_enc="$(urlencode "$origin")"; link="vless://$uuid@$preferred:$port?encryption=none&security=tls&sni=$origin_enc&host=$origin_enc&type=xhttp&path=$path_enc&mode=auto#$(urlencode "$name")";;
-      HY2) entry="${NODE_ENTRY_IPS[$index]}"; family="${NODE_EXIT_FAMILIES[$index]}"; sni="$(config_value "${prefix}_SNI")"; password="${NODE_HY2_PASSWORDS[$index]}"; [[ "$password" == AUTO ]] && password="$(openssl rand -hex 16)" && NODE_HY2_PASSWORDS[$index]="$password"; reality_json="$(jq -cn --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg auth "$password" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '{tag:$tag,listen:$listen,port:$port,protocol:"hysteria",settings:{version:2,users:[{auth:$auth}]},streamSettings:{method:"hysteria",security:"tls",hysteriaSettings:{version:2},tlsSettings:{alpn:["h3"],certificates:[{certificateFile:$cert,keyFile:$key}]}}}')"; outbound_json="$(jq -cn --arg tag "$outtag" --arg strategy "UseIPv$family" '{tag:$tag,protocol:"freedom",settings:{domainStrategy:$strategy}}')"; link="hysteria2://$(urlencode "$password")@$(url_host "$entry"):$port?security=tls&alpn=h3&insecure=0&allowInsecure=0&mport=${NODE_HY2_STARTS[$index]}-${NODE_HY2_ENDS[$index]}&sni=$(urlencode "$sni")&pinSHA256=$CERT_SHA256#$(urlencode "$name")";;
+      HY2) entry="${NODE_ENTRY_IPS[$index]}"; family="${NODE_EXIT_FAMILIES[$index]}"; sni="$(config_value "${prefix}_SNI")"; password="${NODE_HY2_PASSWORDS[$index]}"; [[ "$password" == AUTO ]] && password="$(openssl rand -hex 16)" && NODE_HY2_PASSWORDS[$index]="$password"; reality_json="$(jq -cn --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg auth "$password" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '{tag:$tag,listen:$listen,port:$port,protocol:"hysteria",settings:{version:2,users:[{auth:$auth}]},streamSettings:{method:"hysteria",security:"tls",hysteriaSettings:{version:2},tlsSettings:{alpn:["h3"],certificates:[{certificateFile:$cert,keyFile:$key}]}}}')"; outbound_json="$(jq -cn --arg tag "$outtag" --arg strategy "UseIPv$family" '{tag:$tag,protocol:"freedom",settings:{domainStrategy:$strategy}}')"; link="hysteria2://$(urlencode "$password")@$(url_host "$entry"):$port?security=tls&alpn=h3&insecure=0&allowInsecure=0$( (( ${NODE_HY2_STARTS[$index]} < ${NODE_HY2_ENDS[$index]} )) && printf '&mport=%s-%s' "${NODE_HY2_STARTS[$index]}" "${NODE_HY2_ENDS[$index]}" )&sni=$(urlencode "$sni")&pinSHA256=$CERT_SHA256#$(urlencode "$name")";;
     esac
-    NEW_INBOUNDS+=("$reality_json"); NEW_OUTBOUNDS+=("$outbound_json"); rule_json="$(jq -cn --arg inbound "$tag" --arg outbound "$outtag" '{type:"field",inboundTag:[$inbound],outboundTag:$outbound}')"; NEW_RULES+=("$rule_json"); NODE_LINES+=("$link")
+    duplicate_key="$type:$port"
+    if [[ -n "${FIRST_UUID[$duplicate_key]+x}" ]]; then
+      case "$type" in
+        REALITY) uuid="${FIRST_UUID[$duplicate_key]}"; public_key="${FIRST_PUBLIC[$duplicate_key]}"; short_id="${FIRST_SHORT[$duplicate_key]}"; link="vless://$uuid@$(url_host "$entry"):$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_SNI_ENC&fp=chrome&pbk=$(urlencode "$public_key")&sid=$short_id&type=tcp&headerType=none#$(urlencode "$name")";;
+        CDN) uuid="${FIRST_UUID[$duplicate_key]}"; origin_enc="$(urlencode "$origin")"; link="vless://$uuid@$preferred:$port?encryption=none&security=tls&sni=$origin_enc&host=$origin_enc&type=xhttp&path=$path_enc&mode=auto#$(urlencode "$name")";;
+        HY2) password="${FIRST_PASSWORD[$duplicate_key]}"; link="hysteria2://$(urlencode "$password")@$(url_host "$entry"):$port?security=tls&alpn=h3&insecure=0&allowInsecure=0$( (( ${NODE_HY2_STARTS[$index]} < ${NODE_HY2_ENDS[$index]} )) && printf '&mport=%s-%s' "${NODE_HY2_STARTS[$index]}" "${NODE_HY2_ENDS[$index]}" )&sni=$(urlencode "$sni")&pinSHA256=$CERT_SHA256#$(urlencode "$name")";;
+      esac
+      reality_json=""; outbound_json=""; rule_json=""
+    else
+      FIRST_UUID[$duplicate_key]="${uuid:-}"; FIRST_PUBLIC[$duplicate_key]="${public_key:-}"; FIRST_SHORT[$duplicate_key]="${short_id:-}"; FIRST_PASSWORD[$duplicate_key]="${password:-}"
+    fi
+    [[ -n "$reality_json" ]] && NEW_INBOUNDS+=("$reality_json")
+    [[ -n "$outbound_json" ]] && NEW_OUTBOUNDS+=("$outbound_json")
+    [[ -n "$reality_json" ]] && { rule_json="$(jq -cn --arg inbound "$tag" --arg outbound "$outtag" '{type:"field",inboundTag:[$inbound],outboundTag:$outbound}')"; NEW_RULES+=("$rule_json"); }
+    NODE_LINES+=("$link")
   done
 }
 
@@ -193,7 +218,7 @@ merge_xray_config() { local i o r; i="$(printf '%s\n' "${NEW_INBOUNDS[@]}" | jq 
 
 configure_hy2_hop_service() {
   local index nft_file=/etc/xray/yijian-hy2-hop.nft nft_bin="$(command -v nft || true)"
-  if (( ${#HY2_IDS[@]} == 0 )); then
+  if (( ${#HY2_HOP_IDS[@]} == 0 )); then
     if [[ "$SERVICE_MODE" == systemd ]]; then systemctl disable --now xray-yijian-hy2-hop.service >/dev/null 2>&1 || true; else rc-service xray-yijian-hy2-hop stop >/dev/null 2>&1 || true; rc-update del xray-yijian-hy2-hop default >/dev/null 2>&1 || true; fi
     rm -f -- /etc/systemd/system/xray-yijian-hy2-hop.service
     [[ "$SERVICE_MODE" == systemd ]] && systemctl daemon-reload >/dev/null 2>&1 || true
@@ -207,7 +232,7 @@ table inet xray_yijian_hy2 {
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
 EOF
-  for index in "${HY2_IDS[@]}"; do
+  for index in "${HY2_HOP_IDS[@]}"; do
     if [[ "${NODE_IP_FAMILIES[$index]}" == 6 ]]; then
       printf '    ip6 daddr %s udp dport %s-%s redirect to :%s\n' "${NODE_ENTRY_IPS[$index]}" "${NODE_HY2_STARTS[$index]}" "${NODE_HY2_ENDS[$index]}" "${NODE_HY2_STARTS[$index]}" >> "$nft_file"
     else
@@ -383,6 +408,46 @@ EOF
 }
 
 stop_subscription_service() { if [[ "$SERVICE_MODE" == systemd ]]; then systemctl disable --now xray-yijian-sub.service >/dev/null 2>&1 || true; rm -f -- /etc/systemd/system/xray-yijian-sub.service; systemctl daemon-reload >/dev/null 2>&1 || true; else rc-service xray-yijian-sub stop >/dev/null 2>&1 || true; rc-update del xray-yijian-sub default >/dev/null 2>&1 || true; rm -f -- /etc/init.d/xray-yijian-sub; fi; rm -f -- "$OUTPUT_DIR"/yijian-subscription-*.txt "$OUTPUT_DIR/yijian-subscription-nginx.conf"; }
+clear_previous_deployment() {
+  local backup_dir="$OUTPUT_DIR/yijian-install" path target; mkdir -p -- "$backup_dir"
+  if [[ ! -f "$backup_dir/original-config.json" && ! -f "$backup_dir/no-original-config" ]]; then
+    if [[ -f "$CONFIG_PATH" ]]; then cp -p -- "$CONFIG_PATH" "$backup_dir/original-config.json"; else : > "$backup_dir/no-original-config"; fi
+  fi
+  for path in /etc/systemd/system/xray-yijian.service /etc/systemd/system/xray-yijian-sub.service /etc/systemd/system/xray-yijian-hy2-hop.service /etc/init.d/xray-yijian /etc/init.d/xray-yijian-sub /etc/init.d/xray-yijian-hy2-hop; do
+    target="$backup_dir$(printf '%s' "$path" | tr '/' '_')"
+    [[ -e "$path" && ! -e "$target" ]] && cp -p -- "$path" "$target"
+  done
+  if [[ "$SERVICE_MODE" == systemd ]]; then
+    systemctl disable --now xray-yijian-sub.service xray-yijian.service xray-yijian-hy2-hop.service >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  else
+    rc-service xray-yijian-sub stop >/dev/null 2>&1 || true; rc-service xray-yijian stop >/dev/null 2>&1 || true; rc-service xray-yijian-hy2-hop stop >/dev/null 2>&1 || true
+    rc-update del xray-yijian-sub default >/dev/null 2>&1 || true; rc-update del xray-yijian default >/dev/null 2>&1 || true; rc-update del xray-yijian-hy2-hop default >/dev/null 2>&1 || true
+  fi
+  rm -rf -- "$SUB_ROOT" "$OUTPUT_DIR/vless-links.txt" "$OUTPUT_DIR/yijian-subscription-"*.txt "$OUTPUT_DIR/yijian-subscription-nginx.conf" "$OUTPUT_DIR/yijian-subscription-nginx-error.log"
+  rm -f -- /etc/systemd/system/xray-yijian.service /etc/systemd/system/xray-yijian-sub.service /etc/systemd/system/xray-yijian-hy2-hop.service /etc/init.d/xray-yijian /etc/init.d/xray-yijian-sub /etc/init.d/xray-yijian-hy2-hop
+  command_exists nft && nft delete table inet xray_yijian_hy2 >/dev/null 2>&1 || true
+  rm -f -- /etc/xray/yijian-hy2-hop.nft
+  [[ "$SERVICE_MODE" == systemd ]] && systemctl daemon-reload >/dev/null 2>&1 || true
+}
+uninstall_deployment() {
+  [[ "$(id -u)" -eq 0 ]] || die "请使用 root 运行此脚本"
+  detect_platform
+  clear_previous_deployment
+  if [[ -f "$OUTPUT_DIR/yijian-install/original-config.json" ]]; then cp -p -- "$OUTPUT_DIR/yijian-install/original-config.json" "$CONFIG_PATH"; fi
+  local backup_dir="$OUTPUT_DIR/yijian-install" path target
+  for path in /etc/systemd/system/xray-yijian.service /etc/systemd/system/xray-yijian-sub.service /etc/systemd/system/xray-yijian-hy2-hop.service /etc/init.d/xray-yijian /etc/init.d/xray-yijian-sub /etc/init.d/xray-yijian-hy2-hop; do
+    target="$backup_dir$(printf '%s' "$path" | tr '/' '_')"
+    [[ -f "$target" ]] && { mkdir -p -- "$(dirname "$path")"; cp -p -- "$target" "$path"; }
+  done
+  rm -f -- "$OUTPUT_DIR/config.json" "$OUTPUT_DIR/yijian-origin-cert.pem" "$OUTPUT_DIR/yijian-origin-key.pem"
+  if [[ -s "$OUTPUT_DIR/yijian-install/packages-installed.txt" ]]; then
+    if [[ "$PACKAGE_MANAGER" == apk ]]; then apk del $(cat "$OUTPUT_DIR/yijian-install/packages-installed.txt") >/dev/null 2>&1 || true; else DEBIAN_FRONTEND=noninteractive apt-get remove -y $(cat "$OUTPUT_DIR/yijian-install/packages-installed.txt") >/dev/null 2>&1 || true; fi
+  fi
+  [[ -f "$OUTPUT_DIR/yijian-install/xray-installed-by-yijian" ]] && rm -f -- /usr/local/bin/xray
+  rm -rf -- "$OUTPUT_DIR/yijian-install"
+  ok "脚本生成的 Xray、订阅、HY2 跳跃服务及节点文件已卸载"
+}
 verify_subscription() {
   local local_url response="" host_header="$SUB_DOMAIN"
   if [[ "$SUBSCRIPTION_MODE" == IP ]]; then host_header="$SUB_IP"; [[ "$SUB_HOST_FAMILY" == 6 ]] && local_url="http://[::1]:$SUB_PORT/$SUB_TOKEN/jhsub.txt" || local_url="http://127.0.0.1:$SUB_PORT/$SUB_TOKEN/jhsub.txt"; else [[ "$SUB_PORT" == 443 ]] && local_url="https://$SUB_DOMAIN/$SUB_TOKEN/jhsub.txt" || local_url="https://$SUB_DOMAIN:$SUB_PORT/$SUB_TOKEN/jhsub.txt"; fi
@@ -401,19 +466,22 @@ show_deployment() {
 main() {
   [[ "$(id -u)" -eq 0 ]] || die "请使用 root 运行此脚本"
   if [[ "${1:-}" == show ]]; then show_deployment "${2:-$OUTPUT_DIR}"; return; fi
-  [[ -z "${1:-}" ]] || die "未知参数：$1；可用参数为 show [输出目录]"
+  if [[ "${1:-}" == uninstall ]]; then uninstall_deployment; return; fi
+  [[ -z "${1:-}" ]] || die "未知参数：$1；可用参数为 show [输出目录] 或 uninstall"
   detect_platform
   printf 'NAT 一键部署 %s（服务管理：%s，依赖管理：%s）\n' "$SCRIPT_VERSION" "$SERVICE_MODE" "$PACKAGE_MANAGER"
   read_deployment_config
   validate_deployment_config
   TMP_DIR="$(mktemp -d /tmp/xray-yijian.XXXXXX)" || die "无法创建临时目录"
+  mkdir -p -- "$OUTPUT_DIR"
+  mkdir -p -- "$OUTPUT_DIR/yijian-install"
   install_dependencies
   XRAY_BIN="$(find_xray || true)"; if [[ -z "$XRAY_BIN" ]]; then install_xray; fi
-  mkdir -p -- "$OUTPUT_DIR"
   (( CERT_REQUIRED == 0 )) || prepare_certificate
   prepare_base_config
   build_nodes
   merge_xray_config
+  clear_previous_deployment
   install -m 600 "$TMP_CONFIG" "$CONFIG_PATH"
   configure_hy2_hop_service
   start_xray_service
@@ -422,7 +490,7 @@ main() {
   if (( SUBSCRIPTION_ENABLED == 1 )); then ok "${#NODE_IDS[@]} 个节点和订阅服务已部署"; else ok "${#NODE_IDS[@]} 个节点已部署，订阅未启用"; fi
   printf '%s\n' "${NODE_LINES[@]}"
   (( SUBSCRIPTION_ENABLED == 1 )) && printf '订阅网址：%s\n' "$SUB_URL" || printf '订阅网址：未启用\n'
-  for index in "${HY2_IDS[@]}"; do printf '节点 %s 的 HY2 UDP 跳跃范围：%s:%s\n' "$index" "${NODE_HY2_STARTS[$index]}" "${NODE_HY2_ENDS[$index]}"; done
+  for index in "${HY2_HOP_IDS[@]}"; do printf '节点 %s 的 HY2 UDP 跳跃范围：%s:%s\n' "$index" "${NODE_HY2_STARTS[$index]}" "${NODE_HY2_ENDS[$index]}"; done
   printf '节点文件：%s/vless-links.txt\n' "$OUTPUT_DIR"
 }
 main "$@"
