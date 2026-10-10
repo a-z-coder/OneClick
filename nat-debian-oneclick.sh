@@ -434,13 +434,17 @@ uninstall_deployment() {
   [[ "$(id -u)" -eq 0 ]] || die "请使用 root 运行此脚本"
   detect_platform
   clear_previous_deployment
-  if [[ -f "$OUTPUT_DIR/yijian-install/original-config.json" ]]; then cp -p -- "$OUTPUT_DIR/yijian-install/original-config.json" "$CONFIG_PATH"; fi
+  if [[ -f "$OUTPUT_DIR/yijian-install/original-config.json" ]]; then
+    cp -p -- "$OUTPUT_DIR/yijian-install/original-config.json" "$CONFIG_PATH"
+  else
+    rm -f -- "$CONFIG_PATH"
+  fi
   local backup_dir="$OUTPUT_DIR/yijian-install" path target
   for path in /etc/systemd/system/xray-yijian.service /etc/systemd/system/xray-yijian-sub.service /etc/systemd/system/xray-yijian-hy2-hop.service /etc/init.d/xray-yijian /etc/init.d/xray-yijian-sub /etc/init.d/xray-yijian-hy2-hop; do
     target="$backup_dir$(printf '%s' "$path" | tr '/' '_')"
     [[ -f "$target" ]] && { mkdir -p -- "$(dirname "$path")"; cp -p -- "$target" "$path"; }
   done
-  rm -f -- "$OUTPUT_DIR/config.json" "$OUTPUT_DIR/yijian-origin-cert.pem" "$OUTPUT_DIR/yijian-origin-key.pem"
+  rm -f -- "$OUTPUT_DIR/yijian-origin-cert.pem" "$OUTPUT_DIR/yijian-origin-key.pem"
   if [[ -s "$OUTPUT_DIR/yijian-install/packages-installed.txt" ]]; then
     if [[ "$PACKAGE_MANAGER" == apk ]]; then apk del $(cat "$OUTPUT_DIR/yijian-install/packages-installed.txt") >/dev/null 2>&1 || true; else DEBIAN_FRONTEND=noninteractive apt-get remove -y $(cat "$OUTPUT_DIR/yijian-install/packages-installed.txt") >/dev/null 2>&1 || true; fi
   fi
